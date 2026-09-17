@@ -1,24 +1,34 @@
-import streamlit as st
+# ============================================================
+# DISASTER DAMAGE DETECTOR
+# Dark Disaster Response Command Center
+# ============================================================
+
+from pathlib import Path
+from datetime import datetime
+import json
+import math
+import hashlib
+import time
+
 import cv2
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from datetime import datetime
-import hashlib
-import json
-import math
+import streamlit as st
+from PIL import Image
 
-# ============================================================
-# OPTIONAL MAVLINK
-# ============================================================
-
-PYMAVLINK_AVAILABLE = False
-
+# Optional MAVLink support
 try:
     from pymavlink import mavutil
-    PYMAVLINK_AVAILABLE = True
+    MAVLINK_AVAILABLE = True
 except Exception:
-    PYMAVLINK_AVAILABLE = False
+    MAVLINK_AVAILABLE = False
+
+# Optional YOLO support
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
 
 
 # ============================================================
@@ -29,1237 +39,843 @@ st.set_page_config(
     page_title="Disaster Response Command Center",
     page_icon="🛰️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
-# DARK COMMAND CENTER UI
+# DARK THEME
+# ============================================================
+# IMPORTANT:
+# This is ONLY CSS styling.
+# All visible dashboard content below uses native Streamlit
+# components. No HTML dashboard markup is used.
 # ============================================================
 
-st.markdown("""
-<style>
-
-/* =========================================================
-   GLOBAL
-   ========================================================= */
-
-.stApp {
-    background: #050b14;
-    color: #e8eef7;
-}
-
-.main {
-    background: #050b14;
-}
-
-.block-container {
-    max-width: 1500px;
-    padding-top: 1.2rem;
-    padding-bottom: 2rem;
-}
-
-
-/* =========================================================
-   SIDEBAR
-   ========================================================= */
-
-[data-testid="stSidebar"] {
-    background: #07101d !important;
-    border-right: 1px solid #1a2b40;
-}
-
-[data-testid="stSidebar"] > div {
-    background: #07101d !important;
-}
-
-[data-testid="stSidebar"] * {
-    color: #e8eef7 !important;
-}
-
-[data-testid="stSidebar"] label {
-    color: #9aabc0 !important;
-}
-
-[data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea {
-    background: #0d1928 !important;
-    color: #ffffff !important;
-    border: 1px solid #263b54 !important;
-}
-
-[data-testid="stSidebar"] [data-baseweb="select"] > div {
-    background: #0d1928 !important;
-    border-color: #263b54 !important;
-    color: #ffffff !important;
-}
-
-[data-testid="stSidebar"] [data-baseweb="slider"] {
-    color: #5aa9ff !important;
-}
-
-
-/* =========================================================
-   SIDEBAR BRAND
-   ========================================================= */
-
-.sidebar-brand {
-    padding: 6px 4px 22px 4px;
-}
-
-.sidebar-brand-title {
-    font-size: 21px;
-    font-weight: 900;
-    letter-spacing: .5px;
-    color: #ffffff;
-}
-
-.sidebar-brand-subtitle {
-    margin-top: 4px;
-    color: #6f8299;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1.2px;
-}
-
-
-/* =========================================================
-   SIDEBAR PANELS
-   ========================================================= */
-
-.control-panel {
-    background: #0b1726;
-    border: 1px solid #1b3048;
-    border-radius: 14px;
-    padding: 15px;
-    margin-bottom: 15px;
-}
-
-.panel-subtitle {
-    color: #70859d;
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: 1px;
-    margin-bottom: 5px;
-}
-
-.status-online {
-    color: #4ade80;
-    font-size: 18px;
-    font-weight: 900;
-    margin-bottom: 4px;
-}
-
-
-/* =========================================================
-   MAIN HEADER
-   ========================================================= */
-
-.command-header {
-    background:
-        linear-gradient(
-            135deg,
-            #0b1726,
-            #0d1c2e
-        );
-
-    border: 1px solid #1c324b;
-    border-radius: 20px;
-    padding: 24px 28px;
-    margin-bottom: 18px;
-
-    box-shadow:
-        0 12px 40px rgba(0,0,0,.28);
-}
-
-.header-title {
-    color: #ffffff;
-    font-size: 29px;
-    font-weight: 900;
-    letter-spacing: -.7px;
-}
-
-.header-subtitle {
-    color: #8295aa;
-    font-size: 13px;
-    margin-top: 5px;
-}
-
-.header-meta {
-    color: #5f748d;
-    font-size: 10px;
-    margin-top: 12px;
-    letter-spacing: .5px;
-}
-
-.live-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-
-    background: #092319;
-    border: 1px solid #174c32;
-
-    color: #4ade80;
-
-    padding: 8px 13px;
-    border-radius: 999px;
-
-    font-size: 11px;
-    font-weight: 800;
-}
-
-.live-dot {
-    width: 8px;
-    height: 8px;
-    background: #4ade80;
-    border-radius: 50%;
-    box-shadow: 0 0 10px #4ade80;
-}
-
-
-/* =========================================================
-   KPI
-   ========================================================= */
-
-.kpi-card {
-    background: #0b1726;
-    border: 1px solid #1b3048;
-    border-radius: 16px;
-
-    padding: 17px;
-    min-height: 105px;
-
-    box-shadow:
-        0 7px 25px rgba(0,0,0,.22);
-
-    transition: .2s ease;
-}
-
-.kpi-card:hover {
-    transform: translateY(-2px);
-    border-color: #315271;
-}
-
-.kpi-label {
-    color: #71869e;
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: .7px;
-    text-transform: uppercase;
-}
-
-.kpi-value {
-    color: #ffffff;
-    font-size: 25px;
-    font-weight: 900;
-    margin-top: 8px;
-}
-
-.kpi-small {
-    color: #61758b;
-    font-size: 10px;
-    margin-top: 3px;
-}
-
-
-/* =========================================================
-   SECTION
-   ========================================================= */
-
-.section-title {
-    color: #ffffff;
-    font-size: 19px;
-    font-weight: 850;
-
-    margin-top: 22px;
-    margin-bottom: 5px;
-}
-
-.section-caption {
-    color: #70849a;
-    font-size: 11px;
-    margin-bottom: 14px;
-}
-
-
-/* =========================================================
-   CARDS
-   ========================================================= */
-
-.info-card {
-    background: #0b1726;
-    border: 1px solid #1b3048;
-    border-radius: 15px;
-    padding: 17px;
-
-    color: #e8eef7;
-
-    box-shadow:
-        0 6px 22px rgba(0,0,0,.18);
-}
-
-.info-card-title {
-    color: #ffffff;
-    font-size: 13px;
-    font-weight: 800;
-}
-
-.info-card-text {
-    color: #74889e;
-    font-size: 11px;
-    line-height: 1.6;
-    margin-top: 6px;
-}
-
-
-/* =========================================================
-   DARK MISSION PANEL
-   ========================================================= */
-
-.mission-panel {
-    background:
-        linear-gradient(
-            145deg,
-            #0d1d30,
-            #091522
-        );
-
-    border: 1px solid #1d3853;
-    border-radius: 17px;
-
-    padding: 20px;
-
-    box-shadow:
-        inset 0 1px 0 rgba(255,255,255,.02),
-        0 10px 30px rgba(0,0,0,.25);
-}
-
-.mission-label {
-    color: #6d829a;
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: 1px;
-}
-
-.mission-value {
-    color: #ffffff;
-    font-size: 21px;
-    font-weight: 900;
-    margin-top: 4px;
-}
-
-.mission-coord {
-    color: #58a6ff;
-    font-size: 13px;
-    margin-top: 2px;
-}
-
-
-/* =========================================================
-   ALERT
-   ========================================================= */
-
-.survivor-alert {
-    background:
-        linear-gradient(
-            135deg,
-            #211015,
-            #160d12
-        );
-
-    border: 1px solid #6e2730;
-    border-left: 5px solid #ef4444;
-
-    border-radius: 15px;
-
-    padding: 17px 19px;
-
-    margin-bottom: 10px;
-
-    box-shadow:
-        0 8px 25px rgba(239,68,68,.08);
-}
-
-.alert-title {
-    color: #ff6262;
-    font-size: 16px;
-    font-weight: 900;
-}
-
-.alert-text {
-    color: #b77b82;
-    font-size: 11px;
-    margin-top: 4px;
-}
-
-.alert-data {
-    color: #dce4ed;
-    font-size: 11px;
-    margin-top: 10px;
-}
-
-
-/* =========================================================
-   BADGES
-   ========================================================= */
-
-.badge {
-    display: inline-block;
-    padding: 5px 8px;
-
-    border-radius: 6px;
-
-    font-size: 9px;
-    font-weight: 800;
-
-    margin-right: 4px;
-}
-
-.badge-red {
-    background: #321216;
-    color: #ff6b6b;
-    border: 1px solid #64262e;
-}
-
-.badge-blue {
-    background: #0c2035;
-    color: #58a6ff;
-    border: 1px solid #20486b;
-}
-
-.badge-orange {
-    background: #2b1d0c;
-    color: #f59e0b;
-    border: 1px solid #59401a;
-}
-
-.badge-green {
-    background: #0b2518;
-    color: #4ade80;
-    border: 1px solid #1d5835;
-}
-
-
-/* =========================================================
-   STREAMLIT ELEMENTS
-   ========================================================= */
-
-.stButton > button {
-    background: #102338;
-    color: #eaf2fb;
-
-    border: 1px solid #28445f;
-    border-radius: 9px;
-
-    font-weight: 800;
-
-    min-height: 40px;
-}
-
-.stButton > button:hover {
-    background: #15304a;
-    border-color: #3d6b92;
-    color: #ffffff;
-}
-
-.stButton > button[kind="primary"] {
-    background: #125a91;
-    border-color: #237bb8;
-    color: white;
-}
-
-.stButton > button[kind="primary"]:hover {
-    background: #1670ad;
-}
-
-
-/* =========================================================
-   TABS
-   ========================================================= */
-
-.stTabs [data-baseweb="tab-list"] {
-    gap: 5px;
-    background: #081321;
-    padding: 6px;
-    border: 1px solid #192d43;
-    border-radius: 12px;
-}
-
-.stTabs [data-baseweb="tab"] {
-    color: #72879e;
-    font-size: 11px;
-    font-weight: 800;
-}
-
-.stTabs [aria-selected="true"] {
-    background: #10283e !important;
-    color: #ffffff !important;
-    border-radius: 8px;
-}
-
-
-/* =========================================================
-   FILE UPLOADER
-   ========================================================= */
-
-[data-testid="stFileUploader"] {
-    background: #0b1726;
-    border: 1px solid #1b3048;
-    border-radius: 13px;
-    padding: 4px;
-}
-
-[data-testid="stFileUploader"] section {
-    background: #0b1726 !important;
-}
-
-
-/* =========================================================
-   DATAFRAME
-   ========================================================= */
-
-[data-testid="stDataFrame"] {
-    border: 1px solid #1b3048;
-    border-radius: 10px;
-}
-
-
-/* =========================================================
-   MAP
-   ========================================================= */
-
-[data-testid="stMap"] {
-    border: 1px solid #1b3048;
-    border-radius: 14px;
-    overflow: hidden;
-}
-
-
-/* =========================================================
-   IMAGE
-   ========================================================= */
-
-[data-testid="stImage"] {
-    border-radius: 12px;
-    overflow: hidden;
-}
-
-
-/* =========================================================
-   ALERT BOXES
-   ========================================================= */
-
-.stAlert {
-    border-radius: 10px;
-}
-
-
-/* =========================================================
-   FOOTER
-   ========================================================= */
-
-.footer {
-    margin-top: 35px;
-    padding: 18px;
-
-    border-top: 1px solid #192c41;
-
-    text-align: center;
-
-    color: #566b81;
-    font-size: 9px;
-    letter-spacing: .5px;
-}
-
-
-/* =========================================================
-   MOBILE
-   ========================================================= */
-
-@media(max-width: 900px) {
-
-    .header-title {
-        font-size: 22px;
-    }
-
-    .command-header {
-        padding: 18px;
-    }
-
-}
-
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background: #07101d;
+            color: #e8eef7;
+        }
+
+        [data-testid="stAppViewContainer"] {
+            background: #07101d;
+        }
+
+        [data-testid="stHeader"] {
+            background: #07101d;
+        }
+
+        [data-testid="stSidebar"] {
+            background: #050c16;
+            border-right: 1px solid #1d3349;
+        }
+
+        [data-testid="stSidebar"] * {
+            color: #dce7f4;
+        }
+
+        h1, h2, h3, h4 {
+            color: #f3f7fb !important;
+        }
+
+        p, label, span {
+            color: #cbd7e5;
+        }
+
+        [data-testid="stMetric"] {
+            background: #0d1b2a;
+            border: 1px solid #1c3b55;
+            border-radius: 14px;
+            padding: 14px;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: #f3f7fb;
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: #91a7bc;
+        }
+
+        div[data-testid="stExpander"] {
+            background: #0b1826;
+            border: 1px solid #1c3b55;
+            border-radius: 12px;
+        }
+
+        .stButton > button {
+            border-radius: 9px;
+            border: 1px solid #31516c;
+            background: #102437;
+            color: #eaf3fb;
+            min-height: 42px;
+        }
+
+        .stButton > button:hover {
+            border-color: #5d9ac5;
+            background: #16344d;
+        }
+
+        .stTextInput input,
+        .stNumberInput input,
+        .stSelectbox div,
+        .stMultiSelect div {
+            background: #0d1a29 !important;
+            color: #edf4fa !important;
+        }
+
+        [data-testid="stFileUploader"] {
+            background: #0b1826;
+            border: 1px dashed #31516c;
+            border-radius: 12px;
+        }
+
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+        }
+
+        hr {
+            border-color: #20384e;
+        }
+
+        [data-testid="stDataFrame"] {
+            border: 1px solid #1c3b55;
+            border-radius: 10px;
+        }
+
+        .small-muted {
+            color: #7f96aa;
+            font-size: 0.85rem;
+        }
+
+        .status-online {
+            color: #57d68d;
+            font-weight: 700;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
-# DIRECTORIES
+# PATHS
 # ============================================================
 
-DRONE_ROOT = Path("drone_history")
-DRONE_SCANS = DRONE_ROOT / "scans"
-DRONE_RESULTS = DRONE_ROOT / "results"
+BASE_DIR = Path(__file__).resolve().parent
 
-DRONE_ROOT.mkdir(exist_ok=True)
-DRONE_SCANS.mkdir(exist_ok=True)
-DRONE_RESULTS.mkdir(exist_ok=True)
+HISTORY_DIR = BASE_DIR / "drone_history"
+SCANS_DIR = HISTORY_DIR / "scans"
+RESULTS_DIR = HISTORY_DIR / "results"
 
-NOTIFICATION_FILE = DRONE_ROOT / "notifications.json"
-TELEMETRY_FILE = DRONE_ROOT / "telemetry.json"
+NOTIFICATIONS_FILE = HISTORY_DIR / "notifications.json"
+TELEMETRY_FILE = HISTORY_DIR / "telemetry.json"
+
+HISTORY_DIR.mkdir(exist_ok=True)
+SCANS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "satellite_result" not in st.session_state:
-    st.session_state.satellite_result = None
-
-if "drone_history" not in st.session_state:
-    st.session_state.drone_history = None
-
-if "drone_last_hash" not in st.session_state:
-    st.session_state.drone_last_hash = ""
-
-if "drone_current_analysis" not in st.session_state:
-    st.session_state.drone_current_analysis = None
-
-if "notifications" not in st.session_state:
-    st.session_state.notifications = None
-
-if "telemetry" not in st.session_state:
-    st.session_state.telemetry = None
-
-if "demo_step" not in st.session_state:
-    st.session_state.demo_step = 0
-
-if "gps" not in st.session_state:
-    st.session_state.gps = {
-        "latitude": 23.2599,
-        "longitude": 77.4126,
-        "altitude": 50.0,
+DEFAULTS = {
+    "gps": {
+        "lat": 23.2599,
+        "lon": 77.4126,
+        "altitude": 80.0,
         "heading": 0.0,
-        "source": "Demo"
-    }
+        "source": "Manual",
+        "timestamp": None,
+    },
+    "notifications": [],
+    "telemetry": [],
+    "last_drone_result": None,
+    "last_satellite_result": None,
+    "last_camera_result": None,
+    "yolo_model": None,
+}
+
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
-# BASIC FUNCTIONS
+# BASIC HELPERS
 # ============================================================
 
 def now_string():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def load_json(path, default):
-    try:
-        if not path.exists():
-            return default
-
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    except Exception:
-        return default
+def make_scan_id(prefix="SCAN"):
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000}"
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+def image_hash(image):
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+
+    return hashlib.sha256(
+        image.tobytes()
+    ).hexdigest()[:16]
 
 
 def uploaded_to_cv(uploaded_file):
+    image = Image.open(uploaded_file).convert("RGB")
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-    if uploaded_file is None:
+
+def cv_to_pil(image):
+    if image is None:
         return None
 
-    data = uploaded_file.getvalue()
+    if len(image.shape) == 2:
+        return Image.fromarray(image)
 
-    if not data:
-        return None
-
-    array = np.frombuffer(data, np.uint8)
-
-    return cv2.imdecode(
-        array,
-        cv2.IMREAD_COLOR
+    return Image.fromarray(
+        cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     )
 
 
 def cv_to_rgb(image):
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    if image is None:
-        return None
 
-    return cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2RGB
+def resize_same(image1, image2, width=1000):
+    if image1 is None or image2 is None:
+        return None, None
+
+    h1, w1 = image1.shape[:2]
+
+    if w1 > width:
+        scale = width / w1
+        image1 = cv2.resize(
+            image1,
+            (int(w1 * scale), int(h1 * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    h2, w2 = image2.shape[:2]
+
+    if w2 > width:
+        scale = width / w2
+        image2 = cv2.resize(
+            image2,
+            (int(w2 * scale), int(h2 * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    target_h = min(image1.shape[0], image2.shape[0])
+    target_w = min(image1.shape[1], image2.shape[1])
+
+    image1 = cv2.resize(
+        image1,
+        (target_w, target_h),
+        interpolation=cv2.INTER_AREA,
     )
 
+    image2 = cv2.resize(
+        image2,
+        (target_w, target_h),
+        interpolation=cv2.INTER_AREA,
+    )
 
-def image_hash(uploaded_file):
-
-    if uploaded_file is None:
-        return ""
-
-    return hashlib.sha256(
-        uploaded_file.getvalue()
-    ).hexdigest()
+    return image1, image2
 
 
 # ============================================================
-# GPS
+# JSON STORAGE
 # ============================================================
 
-def haversine_m(lat1, lon1, lat2, lon2):
-
+def load_json(path, default):
     try:
-        lat1 = float(lat1)
-        lon1 = float(lon1)
-        lat2 = float(lat2)
-        lon2 = float(lon2)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
-        return float("inf")
+        pass
 
-    radius = 6371000
+    return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        st.warning(f"Could not save {path.name}: {e}")
+
+
+def load_notifications():
+    return load_json(NOTIFICATIONS_FILE, [])
+
+
+def save_notifications(data):
+    save_json(NOTIFICATIONS_FILE, data)
+
+
+def load_telemetry():
+    return load_json(TELEMETRY_FILE, [])
+
+
+def save_telemetry(data):
+    save_json(TELEMETRY_FILE, data)
+
+
+# ============================================================
+# GPS FUNCTIONS
+# ============================================================
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    earth_radius = 6371.0
 
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
 
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
 
     a = (
-        math.sin(dp / 2) ** 2
-        +
-        math.cos(p1)
+        math.sin(dlat / 2) ** 2
+        + math.cos(p1)
         * math.cos(p2)
-        * math.sin(dl / 2) ** 2
+        * math.sin(dlon / 2) ** 2
     )
 
-    return radius * 2 * math.atan2(
-        math.sqrt(a),
-        math.sqrt(1 - a)
-    )
+    return earth_radius * 2 * math.asin(math.sqrt(a))
 
 
-def save_telemetry(point):
+def generate_demo_gps():
+    base_lat = 23.2599
+    base_lon = 77.4126
 
-    data = load_json(
-        TELEMETRY_FILE,
-        []
-    )
+    t = time.time()
 
-    data.append(point)
+    lat = base_lat + math.sin(t / 15) * 0.002
+    lon = base_lon + math.cos(t / 18) * 0.002
 
-    save_json(
-        TELEMETRY_FILE,
-        data[-500:]
-    )
+    altitude = 70 + math.sin(t / 10) * 15
+    heading = (t * 8) % 360
+
+    return {
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "altitude": round(altitude, 2),
+        "heading": round(heading, 2),
+        "source": "Demo Simulator",
+        "timestamp": now_string(),
+    }
 
 
-def read_mavlink_gps(endpoint, baud):
-
-    if not PYMAVLINK_AVAILABLE:
-        raise RuntimeError(
-            "pymavlink is not installed."
-        )
-
-    connection = mavutil.mavlink_connection(
-        endpoint,
-        baud=baud
-    )
+def read_mavlink(endpoint, baud):
+    if not MAVLINK_AVAILABLE:
+        return None, "pymavlink is not installed."
 
     try:
+        connection = mavutil.mavlink_connection(
+            endpoint,
+            baud=baud,
+        )
 
-        message = connection.recv_match(
+        msg = connection.recv_match(
             type="GLOBAL_POSITION_INT",
             blocking=True,
-            timeout=5
+            timeout=3,
         )
 
-        if message is None:
-            raise RuntimeError(
-                "No GPS telemetry received."
-            )
+        if msg is None:
+            return None, "No GPS telemetry received."
 
-        altitude = (
-            message.relative_alt / 1000
-            if getattr(
-                message,
-                "relative_alt",
-                0
-            )
-            else message.alt / 1000
-        )
-
-        heading = (
-            message.hdg / 100
-            if getattr(
-                message,
-                "hdg",
-                65535
-            ) != 65535
-            else 0
-        )
-
-        return {
-            "latitude": message.lat / 1e7,
-            "longitude": message.lon / 1e7,
-            "altitude": altitude,
-            "heading": heading,
+        gps = {
+            "lat": round(msg.lat / 1e7, 6),
+            "lon": round(msg.lon / 1e7, 6),
+            "altitude": round(msg.relative_alt / 1000, 2),
+            "heading": round(msg.hdg / 100, 2),
             "source": "MAVLink",
-            "timestamp": now_string()
+            "timestamp": now_string(),
         }
 
-    finally:
+        return gps, None
 
-        try:
-            connection.close()
-        except Exception:
-            pass
+    except Exception as e:
+        return None, str(e)
+
+
+def update_gps(source, lat=None, lon=None, altitude=None, heading=None,
+               mavlink_endpoint=None, mavlink_baud=57600):
+
+    if source == "Demo Simulator":
+        gps = generate_demo_gps()
+
+    elif source == "MAVLink":
+        gps, error = read_mavlink(
+            mavlink_endpoint,
+            mavlink_baud,
+        )
+
+        if gps is None:
+            return False, error
+
+    else:
+        gps = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "altitude": float(altitude),
+            "heading": float(heading),
+            "source": "Manual",
+            "timestamp": now_string(),
+        }
+
+    st.session_state.gps = gps
+
+    telemetry = load_telemetry()
+
+    telemetry.append(gps)
+
+    telemetry = telemetry[-500:]
+
+    save_telemetry(telemetry)
+
+    return True, None
 
 
 # ============================================================
-# DRONE HISTORY
+# DRONE SCAN HISTORY
 # ============================================================
 
-def load_drone_history():
-
-    files = sorted(
-        DRONE_ROOT.glob("scan_*.json"),
-        key=lambda x: x.stat().st_mtime
-    )
-
+def load_scan_history():
     records = []
 
-    for file in files:
-
+    for file in HISTORY_DIR.glob("scan_*.json"):
         try:
-
-            with open(
-                file,
-                "r",
-                encoding="utf-8"
-            ) as f:
-
-                records.append(
-                    json.load(f)
-                )
-
+            with open(file, "r", encoding="utf-8") as f:
+                records.append(json.load(f))
         except Exception:
             continue
+
+    records.sort(
+        key=lambda x: x.get("timestamp", ""),
+        reverse=True,
+    )
 
     return records
 
 
-def next_scan_id():
+def save_scan_record(record):
+    scan_id = record["scan_id"]
 
-    numbers = []
+    path = HISTORY_DIR / f"scan_{scan_id}.json"
 
-    for file in DRONE_ROOT.glob(
-        "scan_*.json"
-    ):
+    save_json(path, record)
 
-        try:
 
-            numbers.append(
-                int(
-                    file.stem.split("_")[1]
+def find_nearest_scan(lat, lon, radius_km, scan_type=None):
+    history = load_scan_history()
+
+    candidates = []
+
+    for scan in history:
+
+        if scan_type and scan.get("scan_type") != scan_type:
+            continue
+
+        scan_lat = scan.get("lat")
+        scan_lon = scan.get("lon")
+
+        if scan_lat is None or scan_lon is None:
+            continue
+
+        distance = haversine_km(
+            lat,
+            lon,
+            scan_lat,
+            scan_lon,
+        )
+
+        if distance <= radius_km:
+            candidates.append(
+                (
+                    distance,
+                    scan,
                 )
             )
 
-        except Exception:
-            pass
-
-    return f"scan_{max(numbers, default=0)+1:04d}"
-
-
-def save_drone_record(record):
-
-    path = (
-        DRONE_ROOT
-        /
-        f'{record["scan_id"]}.json'
+    candidates.sort(
+        key=lambda x: x[0]
     )
 
-    save_json(
-        path,
-        record
-    )
+    if candidates:
+        return candidates[0]
 
-
-def save_drone_image(
-    image,
-    scan_id
-):
-
-    path = (
-        DRONE_SCANS
-        /
-        f"{scan_id}.png"
-    )
-
-    cv2.imwrite(
-        str(path),
-        image
-    )
-
-    return str(path)
-
-
-def save_result_image(
-    image,
-    scan_id,
-    suffix
-):
-
-    path = (
-        DRONE_RESULTS
-        /
-        f"{scan_id}_{suffix}.png"
-    )
-
-    cv2.imwrite(
-        str(path),
-        image
-    )
-
-    return str(path)
+    return None
 
 
 # ============================================================
 # IMAGE ALIGNMENT
 # ============================================================
 
-def align_images(
-    reference,
-    current
-):
+def align_images(reference, current):
+    ref_gray = cv2.cvtColor(
+        reference,
+        cv2.COLOR_BGR2GRAY,
+    )
 
-    if reference is None or current is None:
-        return None, False, 0
+    cur_gray = cv2.cvtColor(
+        current,
+        cv2.COLOR_BGR2GRAY,
+    )
 
-    try:
+    orb = cv2.ORB_create(
+        nfeatures=3000
+    )
 
-        ref_gray = cv2.cvtColor(
-            reference,
-            cv2.COLOR_BGR2GRAY
-        )
+    key1, desc1 = orb.detectAndCompute(
+        ref_gray,
+        None,
+    )
 
-        cur_gray = cv2.cvtColor(
-            current,
-            cv2.COLOR_BGR2GRAY
-        )
+    key2, desc2 = orb.detectAndCompute(
+        cur_gray,
+        None,
+    )
 
-        orb = cv2.ORB_create(
-            nfeatures=3000
-        )
+    if desc1 is None or desc2 is None:
+        return current, False
 
-        kp1, des1 = orb.detectAndCompute(
-            ref_gray,
-            None
-        )
+    matcher = cv2.BFMatcher(
+        cv2.NORM_HAMMING
+    )
 
-        kp2, des2 = orb.detectAndCompute(
-            cur_gray,
-            None
-        )
+    matches = matcher.knnMatch(
+        desc2,
+        desc1,
+        k=2,
+    )
 
-        if des1 is None or des2 is None:
-            return None, False, 0
+    good = []
 
-        matcher = cv2.BFMatcher(
-            cv2.NORM_HAMMING,
-            crossCheck=True
-        )
+    for pair in matches:
 
-        matches = matcher.match(
-            des1,
-            des2
-        )
+        if len(pair) != 2:
+            continue
 
-        matches = sorted(
-            matches,
-            key=lambda x: x.distance
-        )
+        m, n = pair
 
-        if len(matches) < 10:
-            return None, False, len(matches)
+        if m.distance < 0.75 * n.distance:
+            good.append(m)
 
-        good = matches[
-            :min(80, len(matches))
+    if len(good) < 8:
+        return current, False
+
+    src_pts = np.float32(
+        [
+            key2[m.queryIdx].pt
+            for m in good
         ]
+    ).reshape(-1, 1, 2)
 
-        src = np.float32([
-            kp2[m.trainIdx].pt
+    dst_pts = np.float32(
+        [
+            key1[m.trainIdx].pt
             for m in good
-        ]).reshape(-1, 1, 2)
+        ]
+    ).reshape(-1, 1, 2)
 
-        dst = np.float32([
-            kp1[m.queryIdx].pt
-            for m in good
-        ]).reshape(-1, 1, 2)
+    homography, mask = cv2.findHomography(
+        src_pts,
+        dst_pts,
+        cv2.RANSAC,
+        5.0,
+    )
 
-        matrix, mask = cv2.findHomography(
-            src,
-            dst,
-            cv2.RANSAC,
-            5.0
-        )
+    if homography is None:
+        return current, False
 
-        if matrix is None:
-            return None, False, len(good)
+    h, w = reference.shape[:2]
 
-        h, w = reference.shape[:2]
+    aligned = cv2.warpPerspective(
+        current,
+        homography,
+        (w, h),
+    )
 
-        aligned = cv2.warpPerspective(
-            current,
-            matrix,
-            (w, h)
-        )
+    return aligned, True
 
-        return aligned, True, len(good)
 
-    except Exception:
-
-        return None, False, 0
-
+# ============================================================
+# DAMAGE ANALYSIS
+# ============================================================
 
 def calculate_difference(
     reference,
-    current
+    current,
+    blur_size=5,
+    threshold=35,
 ):
 
-    if reference.shape[:2] != current.shape[:2]:
-
-        current = cv2.resize(
-            current,
-            (
-                reference.shape[1],
-                reference.shape[0]
-            )
-        )
-
-    gray1 = cv2.cvtColor(
+    reference, current = resize_same(
         reference,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    gray2 = cv2.cvtColor(
         current,
-        cv2.COLOR_BGR2GRAY
     )
 
-    blur1 = cv2.GaussianBlur(
-        gray1,
-        (5, 5),
-        0
+    if reference is None:
+        return None, None
+
+    aligned, aligned_ok = align_images(
+        reference,
+        current,
     )
 
-    blur2 = cv2.GaussianBlur(
-        gray2,
-        (5, 5),
-        0
+    if not aligned_ok:
+        aligned = current
+
+    gray_ref = cv2.cvtColor(
+        reference,
+        cv2.COLOR_BGR2GRAY,
     )
 
-    difference = cv2.absdiff(
-        blur1,
-        blur2
+    gray_current = cv2.cvtColor(
+        aligned,
+        cv2.COLOR_BGR2GRAY,
     )
 
-    difference = cv2.normalize(
-        difference,
+    gray_ref = cv2.GaussianBlur(
+        gray_ref,
+        (blur_size, blur_size),
+        0,
+    )
+
+    gray_current = cv2.GaussianBlur(
+        gray_current,
+        (blur_size, blur_size),
+        0,
+    )
+
+    diff = cv2.absdiff(
+        gray_ref,
+        gray_current,
+    )
+
+    diff = cv2.normalize(
+        diff,
         None,
         0,
         255,
-        cv2.NORM_MINMAX
+        cv2.NORM_MINMAX,
     )
 
-    _, threshold = cv2.threshold(
-        difference,
-        35,
+    mask = np.where(
+        diff >= threshold,
         255,
-        cv2.THRESH_BINARY
-    )
+        0,
+    ).astype(np.uint8)
 
     kernel = np.ones(
         (5, 5),
-        np.uint8
+        np.uint8,
     )
 
-    threshold = cv2.morphologyEx(
-        threshold,
+    mask = cv2.morphologyEx(
+        mask,
         cv2.MORPH_OPEN,
-        kernel
+        kernel,
     )
 
-    threshold = cv2.morphologyEx(
-        threshold,
+    mask = cv2.morphologyEx(
+        mask,
         cv2.MORPH_CLOSE,
-        kernel
+        kernel,
     )
 
-    return difference, threshold
+    return diff, mask
 
 
-# ============================================================
-# DAMAGE
-# ============================================================
+def damage_class(value, critical, moderate, low):
+    if value >= critical:
+        return "Critical"
+
+    if value >= moderate:
+        return "Moderate"
+
+    if value >= low:
+        return "Low"
+
+    return "Safe"
+
 
 def create_damage_map(
-    difference,
-    critical,
-    moderate,
-    low
+    reference,
+    current,
+    critical_threshold,
+    moderate_threshold,
+    low_threshold,
 ):
 
-    result = np.zeros(
-        (
-            difference.shape[0],
-            difference.shape[1],
-            3
-        ),
-        dtype=np.uint8
+    diff, mask = calculate_difference(
+        reference,
+        current,
+        threshold=low_threshold,
     )
 
-    result[
-        difference < low
-    ] = [60, 180, 60]
+    if diff is None:
+        return None, None
 
-    result[
-        (difference >= low)
-        &
-        (difference < moderate)
-    ] = [0, 220, 255]
-
-    result[
-        (difference >= moderate)
-        &
-        (difference < critical)
-    ] = [0, 150, 255]
-
-    result[
-        difference >= critical
-    ] = [0, 0, 255]
-
-    return result
-
-
-def damage_percentages(
-    difference,
-    critical,
-    moderate,
-    low
-):
-
-    total = difference.size
-
-    if total == 0:
-        return {
-            "Critical": 0,
-            "Moderate": 0,
-            "Low": 0,
-            "Safe": 0
-        }
-
-    critical_count = np.sum(
-        difference >= critical
+    damage_map = np.zeros_like(
+        current
     )
 
-    moderate_count = np.sum(
-        (difference >= moderate)
-        &
-        (difference < critical)
+    critical = diff >= critical_threshold
+    moderate = (
+        (diff >= moderate_threshold)
+        & (diff < critical_threshold)
+    )
+    low = (
+        (diff >= low_threshold)
+        & (diff < moderate_threshold)
     )
 
-    low_count = np.sum(
-        (difference >= low)
-        &
-        (difference < moderate)
+    damage_map[critical] = [
+        0,
+        0,
+        255,
+    ]
+
+    damage_map[moderate] = [
+        0,
+        165,
+        255,
+    ]
+
+    damage_map[low] = [
+        0,
+        255,
+        255,
+    ]
+
+    safe = ~(
+        critical
+        | moderate
+        | low
     )
 
-    safe_count = (
-        total
-        -
-        critical_count
-        -
-        moderate_count
-        -
-        low_count
+    damage_map[safe] = current[safe] // 4
+
+    return damage_map, diff
+
+
+def damage_statistics(diff, critical, moderate, low):
+
+    total = diff.size
+
+    critical_pixels = np.sum(
+        diff >= critical
+    )
+
+    moderate_pixels = np.sum(
+        (diff >= moderate)
+        & (diff < critical)
+    )
+
+    low_pixels = np.sum(
+        (diff >= low)
+        & (diff < moderate)
+    )
+
+    safe_pixels = total - (
+        critical_pixels
+        + moderate_pixels
+        + low_pixels
     )
 
     return {
         "Critical": round(
-            critical_count / total * 100,
-            2
+            critical_pixels / total * 100,
+            2,
         ),
         "Moderate": round(
-            moderate_count / total * 100,
-            2
+            moderate_pixels / total * 100,
+            2,
         ),
         "Low": round(
-            low_count / total * 100,
-            2
+            low_pixels / total * 100,
+            2,
         ),
         "Safe": round(
-            safe_count / total * 100,
-            2
-        )
+            safe_pixels / total * 100,
+            2,
+        ),
     }
 
 
 # ============================================================
-# COORDINATE MATCHING
+# RESPONDER / DAMAGE MARKERS
 # ============================================================
 
-def find_nearest_scan(
-    history,
-    latitude,
-    longitude,
-    radius,
-    preferred_type=None
-):
+def add_damage_markers(image, diff, threshold=45):
+    output = image.copy()
 
-    candidates = []
+    mask = np.where(
+        diff >= threshold,
+        255,
+        0,
+    ).astype(np.uint8)
 
-    for record in history:
-
-        rlat = record.get("latitude")
-        rlon = record.get("longitude")
-
-        if rlat is None or rlon is None:
-            continue
-
-        if preferred_type:
-            if record.get("scan_type") != preferred_type:
-                continue
-
-        distance = haversine_m(
-            latitude,
-            longitude,
-            rlat,
-            rlon
-        )
-
-        candidates.append(
-            (distance, record)
-        )
-
-    candidates.sort(
-        key=lambda x: x[0]
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
 
-    if not candidates:
-        return None, None
+    markers = []
 
-    distance, record = candidates[0]
+    for contour in contours:
 
-    if distance <= radius:
-        return record, distance
+        area = cv2.contourArea(
+            contour
+        )
 
-    return None, distance
+        if area < 150:
+            continue
+
+        x, y, w, h = cv2.boundingRect(
+            contour
+        )
+
+        cx = x + w // 2
+        cy = y + h // 2
+
+        markers.append(
+            {
+                "x": cx,
+                "y": cy,
+                "area": round(area, 1),
+            }
+        )
+
+        cv2.circle(
+            output,
+            (cx, cy),
+            7,
+            (255, 255, 255),
+            -1,
+        )
+
+        cv2.circle(
+            output,
+            (cx, cy),
+            9,
+            (0, 0, 0),
+            2,
+        )
+
+    return output, markers
 
 
 # ============================================================
@@ -1267,75 +883,70 @@ def find_nearest_scan(
 # ============================================================
 
 @st.cache_resource
-def load_yolo_model(path):
+def load_yolo_model():
 
-    try:
-
-        from ultralytics import YOLO
-
-        return YOLO(path)
-
-    except Exception:
+    if not YOLO_AVAILABLE:
         return None
 
-
-def find_model_path():
-
     candidates = [
-        Path("models/disaster_best.pt"),
-        Path("models/best.pt"),
-        Path("best.pt")
+        BASE_DIR / "models" / "disaster_best.pt",
+        BASE_DIR / "models" / "best.pt",
+        BASE_DIR / "best.pt",
     ]
 
     for path in candidates:
-
         if path.exists():
-            return str(path)
-
-    return "yolo26n.pt"
-
-
-def classify_detection(name):
-
-    name = str(name).lower()
-
-    if name in [
-        "person",
-        "survivor",
-        "human"
-    ]:
-        return "Possible Survivor"
-
-    if name in [
-        "car",
-        "truck",
-        "bus",
-        "motorcycle"
-    ]:
-        return "Vehicle"
-
-    return "Object"
-
-
-def run_yolo(
-    image,
-    confidence
-):
-
-    model = load_yolo_model(
-        find_model_path()
-    )
-
-    if model is None:
-        return image, []
+            try:
+                return YOLO(str(path))
+            except Exception:
+                pass
 
     try:
+        return YOLO("yolo26n.pt")
+    except Exception:
+        try:
+            return YOLO("yolo11n.pt")
+        except Exception:
+            try:
+                return YOLO("yolov8n.pt")
+            except Exception:
+                return None
 
-        results = model.predict(
-            image,
-            conf=confidence,
-            verbose=False
+
+def get_detection_label(names, class_id):
+    try:
+        if isinstance(names, dict):
+            return str(
+                names.get(
+                    int(class_id),
+                    "object",
+                )
+            )
+
+        return str(
+            names[int(class_id)]
         )
+
+    except Exception:
+        return "object"
+
+
+def run_yolo(image, confidence=0.35):
+
+    model = load_yolo_model()
+
+    if model is None:
+        return None, []
+
+    try:
+        results = model.predict(
+            source=image,
+            conf=confidence,
+            verbose=False,
+        )
+
+        if not results:
+            return None, []
 
         result = results[0]
 
@@ -1343,276 +954,248 @@ def run_yolo(
 
         detections = []
 
-        names = result.names
+        if result.boxes is not None:
 
-        for box in result.boxes:
+            for box in result.boxes:
 
-            cls_id = int(
-                box.cls[0]
-            )
-
-            conf = float(
-                box.conf[0]
-            )
-
-            if isinstance(names, dict):
-
-                class_name = names.get(
-                    cls_id,
-                    str(cls_id)
+                xyxy = (
+                    box.xyxy[0]
+                    .cpu()
+                    .numpy()
+                    .tolist()
                 )
 
-            else:
+                conf = float(
+                    box.conf[0]
+                    .cpu()
+                    .numpy()
+                )
 
-                class_name = names[
-                    cls_id
-                ]
+                class_id = int(
+                    box.cls[0]
+                    .cpu()
+                    .numpy()
+                )
 
-            coords = (
-                box.xyxy[0]
-                .tolist()
-            )
+                label = get_detection_label(
+                    result.names,
+                    class_id,
+                )
 
-            detections.append({
-                "class": class_name,
-                "category":
-                    classify_detection(
-                        class_name
-                    ),
-                "confidence":
-                    round(conf * 100, 2),
-                "x1": int(coords[0]),
-                "y1": int(coords[1]),
-                "x2": int(coords[2]),
-                "y2": int(coords[3])
-            })
+                detections.append(
+                    {
+                        "Class": label,
+                        "Confidence": round(
+                            conf,
+                            3,
+                        ),
+                        "X1": round(
+                            xyxy[0]
+                        ),
+                        "Y1": round(
+                            xyxy[1]
+                        ),
+                        "X2": round(
+                            xyxy[2]
+                        ),
+                        "Y2": round(
+                            xyxy[3]
+                        ),
+                    }
+                )
 
         return plotted, detections
 
-    except Exception:
+    except Exception as e:
+        st.error(
+            f"YOLO inference failed: {e}"
+        )
 
-        return image, []
+        return None, []
 
 
 # ============================================================
-# SURVIVOR GPS ESTIMATION
+# SURVIVOR LOCATION ESTIMATION
 # ============================================================
 
-def estimate_detection_coordinate(
-    drone_lat,
-    drone_lon,
-    altitude,
-    heading,
-    image_shape,
+def estimate_ground_position(
+    gps,
     bbox,
+    image_width,
+    image_height,
     hfov,
-    vfov
+    vfov,
 ):
-
-    if altitude <= 0:
-        return drone_lat, drone_lon
-
-    h, w = image_shape[:2]
 
     x1, y1, x2, y2 = bbox
 
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
+    center_x = (
+        x1 + x2
+    ) / 2
 
-    ground_width = (
-        2
-        * altitude
+    center_y = (
+        y1 + y2
+    ) / 2
+
+    normalized_x = (
+        center_x / image_width
+    ) - 0.5
+
+    normalized_y = (
+        center_y / image_height
+    ) - 0.5
+
+    horizontal_angle = (
+        normalized_x * hfov
+    )
+
+    vertical_angle = (
+        normalized_y * vfov
+    )
+
+    altitude = max(
+        float(gps["altitude"]),
+        1.0,
+    )
+
+    horizontal_distance = (
+        altitude
         * math.tan(
-            math.radians(hfov / 2)
+            math.radians(
+                horizontal_angle
+            )
         )
     )
 
-    ground_height = (
-        2
-        * altitude
+    forward_distance = (
+        altitude
         * math.tan(
-            math.radians(vfov / 2)
+            math.radians(
+                -vertical_angle
+            )
         )
+    )
+
+    heading = math.radians(
+        float(gps["heading"])
     )
 
     east = (
-        (cx / w) - .5
-    ) * ground_width
+        horizontal_distance
+        * math.sin(heading)
+        + forward_distance
+        * math.cos(heading)
+    )
 
     north = (
-        .5 - (cy / h)
-    ) * ground_height
-
-    angle = math.radians(
-        heading
+        horizontal_distance
+        * math.cos(heading)
+        - forward_distance
+        * math.sin(heading)
     )
 
-    east_world = (
-        east * math.cos(angle)
-        +
-        north * math.sin(angle)
+    lat = (
+        gps["lat"]
+        + north / 111320
     )
 
-    north_world = (
-        -east * math.sin(angle)
-        +
-        north * math.cos(angle)
-    )
-
-    latitude = (
-        drone_lat
-        +
-        north_world / 111320
-    )
-
-    longitude = (
-        drone_lon
-        +
-        east_world
-        /
-        (
+    lon = (
+        gps["lon"]
+        + east
+        / (
             111320
-            *
-            math.cos(
+            * math.cos(
                 math.radians(
-                    drone_lat
+                    gps["lat"]
                 )
             )
         )
     )
 
-    return latitude, longitude
+    return round(lat, 6), round(lon, 6)
 
 
 def create_survivor_alerts(
     detections,
-    gps,
     image_shape,
-    hfov,
-    vfov,
-    scan_id
+    gps,
+    scan_id,
+    estimate_position=True,
+    hfov=70,
+    vfov=50,
 ):
 
     alerts = []
 
+    height, width = image_shape[:2]
+
     for index, detection in enumerate(
-        detections
+        detections,
+        start=1,
     ):
 
-        if detection["category"] != "Possible Survivor":
+        label = detection["Class"].lower()
+
+        if label != "person":
             continue
 
-        bbox = [
-            detection["x1"],
-            detection["y1"],
-            detection["x2"],
-            detection["y2"]
-        ]
+        x1 = detection["X1"]
+        y1 = detection["Y1"]
+        x2 = detection["X2"]
+        y2 = detection["Y2"]
 
-        lat, lon = estimate_detection_coordinate(
-            gps["latitude"],
-            gps["longitude"],
-            gps["altitude"],
-            gps["heading"],
-            image_shape,
-            bbox,
-            hfov,
-            vfov
-        )
+        if estimate_position:
 
-        alerts.append({
+            lat, lon = estimate_ground_position(
+                gps,
+                (x1, y1, x2, y2),
+                width,
+                height,
+                hfov,
+                vfov,
+            )
 
-            "notification_id":
-                f"{scan_id}_person_{index+1}",
+        else:
+            lat = gps["lat"]
+            lon = gps["lon"]
 
-            "timestamp":
-                now_string(),
+        alert = {
+            "alert_id": make_scan_id("ALERT"),
+            "type": "Possible Survivor",
+            "scan_id": scan_id,
+            "latitude": lat,
+            "longitude": lon,
+            "confidence": round(
+                detection["Confidence"],
+                3,
+            ),
+            "timestamp": now_string(),
+            "gps_source": gps["source"],
+        }
 
-            "type":
-                "SURVIVOR_ALERT",
-
-            "message":
-                "Person / Possible Survivor detected",
-
-            "latitude":
-                round(lat, 7),
-
-            "longitude":
-                round(lon, 7),
-
-            "altitude":
-                round(
-                    float(
-                        gps["altitude"]
-                    ),
-                    2
-                ),
-
-            "confidence":
-                detection["confidence"],
-
-            "scan_id":
-                scan_id,
-
-            "bbox":
-                bbox
-        })
+        alerts.append(alert)
 
     return alerts
 
 
 # ============================================================
-# NOTIFICATIONS
+# ALERT STORAGE
 # ============================================================
 
-def load_notifications():
+def add_alerts(alerts):
 
-    return load_json(
-        NOTIFICATION_FILE,
-        []
-    )
+    if not alerts:
+        return
 
+    existing = load_notifications()
 
-def save_notification(alert):
+    existing.extend(alerts)
 
-    notifications = load_notifications()
+    existing = existing[-1000:]
 
-    notifications.append(alert)
+    save_notifications(existing)
 
-    save_json(
-        NOTIFICATION_FILE,
-        notifications[-500:]
-    )
-
-    st.session_state.notifications = (
-        notifications[-500:]
-    )
-
-
-# ============================================================
-# INITIAL DATA
-# ============================================================
-
-if st.session_state.drone_history is None:
-
-    st.session_state.drone_history = (
-        load_drone_history()
-    )
-
-if st.session_state.notifications is None:
-
-    st.session_state.notifications = (
-        load_notifications()
-    )
-
-if st.session_state.telemetry is None:
-
-    st.session_state.telemetry = (
-        load_json(
-            TELEMETRY_FILE,
-            []
-        )
-    )
+    st.session_state.notifications = existing
 
 
 # ============================================================
@@ -1621,1598 +1204,1027 @@ if st.session_state.telemetry is None:
 
 with st.sidebar:
 
-    st.markdown("""
-    <div class="sidebar-brand">
+    st.title("🛰️ Response Control")
+    st.caption(
+        "Disaster intelligence and field response system"
+    )
 
-        <div class="sidebar-brand-title">
-            🛰️ RESPONSE CONTROL
-        </div>
+    st.divider()
 
-        <div class="sidebar-brand-subtitle">
-            DISASTER INTELLIGENCE SYSTEM
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="control-panel">
-
-        <div class="panel-subtitle">
-            SYSTEM STATUS
-        </div>
-
-        <div class="status-online">
-            🟢 OPERATIONAL
-        </div>
-
-        <div class="panel-subtitle">
-            AI • GPS • DAMAGE ANALYTICS
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("### 🎛️ ANALYSIS")
+    st.subheader("⚙️ Analysis Settings")
 
     critical_threshold = st.slider(
         "Critical Threshold",
-        100,
-        255,
-        180
+        min_value=40,
+        max_value=200,
+        value=100,
+        step=5,
     )
 
     moderate_threshold = st.slider(
         "Moderate Threshold",
-        50,
-        200,
-        100
+        min_value=20,
+        max_value=120,
+        value=65,
+        step=5,
     )
 
     low_threshold = st.slider(
         "Low Threshold",
-        10,
-        100,
-        45
+        min_value=5,
+        max_value=80,
+        value=35,
+        step=5,
     )
 
     st.divider()
 
-    st.markdown("### 🛰️ GPS SOURCE")
+    st.subheader("📡 GPS Telemetry")
 
-    gps_mode = st.selectbox(
-        "Telemetry Mode",
+    gps_source = st.selectbox(
+        "GPS Source",
         [
             "Manual",
             "Demo Simulator",
-            "MAVLink"
-        ]
+            "MAVLink",
+        ],
     )
 
-    if gps_mode == "Manual":
+    manual_lat = st.number_input(
+        "Latitude",
+        value=float(
+            st.session_state.gps["lat"]
+        ),
+        format="%.6f",
+    )
 
-        latitude = st.number_input(
-            "Latitude",
-            value=float(
-                st.session_state.gps[
-                    "latitude"
-                ]
-            ),
-            format="%.7f"
-        )
+    manual_lon = st.number_input(
+        "Longitude",
+        value=float(
+            st.session_state.gps["lon"]
+        ),
+        format="%.6f",
+    )
 
-        longitude = st.number_input(
-            "Longitude",
-            value=float(
-                st.session_state.gps[
-                    "longitude"
-                ]
-            ),
-            format="%.7f"
-        )
+    manual_alt = st.number_input(
+        "Altitude (m)",
+        min_value=1.0,
+        value=float(
+            st.session_state.gps["altitude"]
+        ),
+    )
 
-        altitude = st.number_input(
-            "Altitude (m)",
-            min_value=0.0,
-            value=float(
-                st.session_state.gps[
-                    "altitude"
-                ]
-            )
-        )
+    manual_heading = st.number_input(
+        "Heading (°)",
+        min_value=0.0,
+        max_value=360.0,
+        value=float(
+            st.session_state.gps["heading"]
+        ),
+    )
 
-        heading = st.number_input(
-            "Heading (°)",
-            0.0,
-            359.9,
-            value=float(
-                st.session_state.gps[
-                    "heading"
-                ]
-            )
-        )
+    mavlink_endpoint = "/dev/tty.usbmodem"
 
-        st.session_state.gps = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "altitude": altitude,
-            "heading": heading,
-            "source": "Manual"
-        }
+    mavlink_baud = 57600
 
-    elif gps_mode == "Demo Simulator":
+    if gps_source == "MAVLink":
 
-        base_lat = st.number_input(
-            "Start Latitude",
-            value=23.2599,
-            format="%.7f"
-        )
-
-        base_lon = st.number_input(
-            "Start Longitude",
-            value=77.4126,
-            format="%.7f"
-        )
-
-        step_size = st.slider(
-            "Movement Step",
-            1,
-            20,
-            5
-        )
-
-        demo_altitude = st.number_input(
-            "Altitude (m)",
-            5.0,
-            500.0,
-            50.0
-        )
-
-        demo_heading = st.number_input(
-            "Heading (°)",
-            0.0,
-            359.9,
-            45.0
-        )
-
-        if st.button(
-            "📡 NEXT GPS POSITION",
-            use_container_width=True
-        ):
-
-            st.session_state.demo_step += 1
-
-        movement = (
-            st.session_state.demo_step
-            * step_size
-        )
-
-        st.session_state.gps = {
-            "latitude":
-                base_lat
-                +
-                movement * 0.00001,
-
-            "longitude":
-                base_lon
-                +
-                movement * 0.000015,
-
-            "altitude":
-                demo_altitude,
-
-            "heading":
-                demo_heading,
-
-            "source":
-                "Demo"
-        }
-
-    else:
-
-        if not PYMAVLINK_AVAILABLE:
-
-            st.warning(
-                "Install pymavlink for MAVLink."
-            )
-
-        endpoint = st.text_input(
+        mavlink_endpoint = st.text_input(
             "MAVLink Endpoint",
-            "udp:127.0.0.1:14550"
+            value="/dev/tty.usbmodem",
         )
 
-        baud = st.number_input(
+        mavlink_baud = st.number_input(
             "Baud Rate",
-            9600,
-            921600,
-            57600
+            value=57600,
+            step=9600,
         )
 
-        if st.button(
-            "📡 READ LIVE GPS",
-            use_container_width=True
-        ):
+    if st.button(
+        "🔄 Update Telemetry",
+        width="stretch",
+    ):
 
-            try:
+        success, error = update_gps(
+            gps_source,
+            manual_lat,
+            manual_lon,
+            manual_alt,
+            manual_heading,
+            mavlink_endpoint,
+            mavlink_baud,
+        )
 
-                gps_data = read_mavlink_gps(
-                    endpoint,
-                    int(baud)
-                )
+        if success:
+            st.success(
+                "Telemetry updated."
+            )
 
-                st.session_state.gps = gps_data
-
-                save_telemetry(
-                    gps_data
-                )
-
-                st.success(
-                    "GPS updated."
-                )
-
-            except Exception as error:
-
-                st.error(
-                    str(error)
-                )
+        else:
+            st.error(
+                error
+                or "Telemetry update failed."
+            )
 
     st.divider()
 
-    st.markdown("### 🤖 AI DETECTION")
+    st.subheader("🤖 AI Detection")
 
     yolo_confidence = st.slider(
         "YOLO Confidence",
-        0.10,
-        0.95,
-        0.35
+        min_value=0.10,
+        max_value=0.95,
+        value=0.35,
+        step=0.05,
     )
 
-    hfov = st.number_input(
-        "Camera HFOV (°)",
-        20.0,
-        120.0,
-        60.0
+    estimate_survivor_position = st.checkbox(
+        "Estimate survivor coordinates",
+        value=True,
     )
 
-    vfov = st.number_input(
-        "Camera VFOV (°)",
-        20.0,
-        100.0,
-        45.0
+    hfov = st.slider(
+        "Camera HFOV",
+        30,
+        120,
+        70,
+    )
+
+    vfov = st.slider(
+        "Camera VFOV",
+        20,
+        100,
+        50,
     )
 
     st.divider()
 
-    st.markdown("""
-    <div class="control-panel">
+    st.subheader("🟢 System Status")
 
-        <div class="panel-subtitle">
-            PROTOTYPE NOTICE
-        </div>
+    st.success("SYSTEM OPERATIONAL")
 
-        <div style="
-            color:#7f92a8;
-            font-size:10px;
-            line-height:1.6;
-        ">
-            Person detection is an AI indicator only.
-            Final survivor confirmation requires
-            responder verification.
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
+    st.caption(
+        f"Last telemetry: "
+        f"{st.session_state.gps.get('timestamp') or 'Not updated'}"
+    )
 
 
 # ============================================================
-# CURRENT VALUES
+# LOAD PERSISTENT DATA
 # ============================================================
 
-gps = st.session_state.gps
+notifications = load_notifications()
+st.session_state.notifications = notifications
 
-history = (
-    st.session_state.drone_history
-    or []
-)
-
-notifications = (
-    st.session_state.notifications
-    or []
-)
-
-
-lat = float(
-    gps["latitude"]
-)
-
-lon = float(
-    gps["longitude"]
-)
-
-alt = float(
-    gps["altitude"]
-)
-
-heading = float(
-    gps["heading"]
-)
+scan_history = load_scan_history()
 
 
 # ============================================================
 # MAIN HEADER
 # ============================================================
 
-st.markdown(f"""
-<div class="command-header">
+st.title(
+    "🛰️ Disaster Response Command Center"
+)
 
-    <div style="
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        gap:20px;
-        flex-wrap:wrap;
-    ">
+st.caption(
+    "AI-powered drone damage assessment • GPS intelligence • "
+    "survivor detection • satellite comparison"
+)
 
-        <div>
-
-            <div class="header-title">
-                🛰️ Disaster Response Command Center
-            </div>
-
-            <div class="header-subtitle">
-                AI Damage Intelligence
-                &nbsp;•&nbsp;
-                Drone GPS Tracking
-                &nbsp;•&nbsp;
-                Possible Survivor Detection
-            </div>
-
-            <div class="header-meta">
-                LAST TELEMETRY: {now_string()}
-            </div>
-
-        </div>
-
-        <div class="live-pill">
-            <span class="live-dot"></span>
-            SYSTEM ONLINE
-        </div>
-
-    </div>
-
-</div>
-""", unsafe_allow_html=True)
+st.divider()
 
 
 # ============================================================
 # KPI ROW
 # ============================================================
 
-k1, k2, k3, k4 = st.columns(4)
+gps = st.session_state.gps
 
-with k1:
+col1, col2, col3, col4 = st.columns(4)
 
-    st.markdown(f"""
-    <div class="kpi-card">
-
-        <div class="kpi-label">
-            🛰️ DRONE STATUS
-        </div>
-
-        <div class="kpi-value">
-            LIVE
-        </div>
-
-        <div class="kpi-small">
-            Source: {gps["source"]}
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-
-with k2:
-
-    st.markdown(f"""
-    <div class="kpi-card">
-
-        <div class="kpi-label">
-            📍 CURRENT LOCATION
-        </div>
-
-        <div class="kpi-value">
-            {lat:.5f}
-        </div>
-
-        <div class="kpi-small">
-            {lon:.5f}
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-
-with k3:
-
-    st.markdown(f"""
-    <div class="kpi-card">
-
-        <div class="kpi-label">
-            🚨 ALERTS
-        </div>
-
-        <div class="kpi-value">
-            {len(notifications)}
-        </div>
-
-        <div class="kpi-small">
-            Possible survivor alerts
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-
-with k4:
-
-    st.markdown(f"""
-    <div class="kpi-card">
-
-        <div class="kpi-label">
-            📊 SCANS
-        </div>
-
-        <div class="kpi-value">
-            {len(history)}
-        </div>
-
-        <div class="kpi-small">
-            GPS indexed scans
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🛰️ DRONE COMMAND",
-    "🗺️ SATELLITE ANALYSIS",
-    "📷 CAMERA AI",
-    "🔔 ALERT HISTORY"
-])
-
-
-# ============================================================
-# TAB 1
-# ============================================================
-
-with tab1:
-
-    st.markdown(
-        '<div class="section-title">🛰️ Live Drone Mission</div>',
-        unsafe_allow_html=True
+with col1:
+    st.metric(
+        "🛰️ Drone Status",
+        "LIVE",
+        gps["source"],
     )
 
-    st.markdown(
-        '<div class="section-caption">'
-        'Live position, scan matching and AI response monitoring'
-        '</div>',
-        unsafe_allow_html=True
+with col2:
+    st.metric(
+        "📍 Current Latitude",
+        f"{gps['lat']:.5f}",
+        f"Lon {gps['lon']:.5f}",
     )
 
-    left, right = st.columns(
-        [1.7, 1]
+with col3:
+    st.metric(
+        "🚨 Active Alerts",
+        len(notifications),
+        "Persistent history",
     )
 
-    with left:
+with col4:
+    st.metric(
+        "📊 Indexed Scans",
+        len(scan_history),
+        "GPS indexed",
+    )
 
-        st.markdown("""
-        <div class="info-card">
 
-            <div class="info-card-title">
-                📍 LIVE GPS TRACK
-            </div>
+# ============================================================
+# MAIN TABS
+# ============================================================
 
-            <div class="info-card-text">
-                Current drone position and
-                historical scan locations.
-            </div>
+tab_drone, tab_satellite, tab_camera, tab_alerts = st.tabs(
+    [
+        "🛰️ Drone Command",
+        "🗺️ Satellite Analysis",
+        "📷 Camera AI",
+        "🔔 Alert History",
+    ]
+)
 
-        </div>
-        """, unsafe_allow_html=True)
 
-        gps_points = []
+# ============================================================
+# DRONE COMMAND
+# ============================================================
 
-        for record in history:
+with tab_drone:
 
-            if (
-                record.get("latitude")
-                is not None
-                and
-                record.get("longitude")
-                is not None
-            ):
+    st.header("🛰️ Drone Mission Control")
 
-                gps_points.append({
-                    "latitude":
-                        record["latitude"],
+    top_left, top_right = st.columns(
+        [1.2, 1]
+    )
 
-                    "longitude":
-                        record["longitude"]
-                })
+    with top_left:
 
-        gps_points.append({
-            "latitude": lat,
-            "longitude": lon
-        })
-
-        st.map(
-            pd.DataFrame(gps_points),
-            height=420
+        st.subheader(
+            "📍 Current Drone Position"
         )
 
-    with right:
-
-        st.markdown(f"""
-        <div class="mission-panel">
-
-            <div class="mission-label">
-                CURRENT DRONE POSITION
-            </div>
-
-            <div class="mission-value">
-                GPS LOCKED
-            </div>
-
-            <div class="mission-coord">
-                {lat:.7f}, {lon:.7f}
-            </div>
-
-            <br>
-
-            <div class="mission-label">
-                ALTITUDE
-            </div>
-
-            <div class="mission-value">
-                {alt:.1f} m
-            </div>
-
-            <br>
-
-            <div class="mission-label">
-                HEADING
-            </div>
-
-            <div class="mission-value">
-                {heading:.1f}°
-            </div>
-
-            <br>
-
-            <div class="mission-label">
-                TELEMETRY
-            </div>
-
-            <div class="mission-value">
-                {gps["source"]}
-            </div>
-
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("")
-
-        st.markdown("""
-        <div class="info-card">
-
-            <div class="info-card-title">
-                🎯 COORDINATE MATCHING
-            </div>
-
-            <div class="info-card-text">
-                Drone scans are matched with the
-                nearest historical image using
-                geographic coordinates.
-            </div>
-
-        </div>
-        """, unsafe_allow_html=True)
-
-        coordinate_radius = st.number_input(
-            "Comparison Radius (meters)",
-            5,
-            1000,
-            50
-        )
-
-        scan_type = st.selectbox(
-            "Current Scan Type",
+        map_df = pd.DataFrame(
             [
-                "Monitoring",
-                "Pre-Disaster",
-                "Post-Disaster"
+                {
+                    "lat": gps["lat"],
+                    "lon": gps["lon"],
+                }
             ]
         )
 
-
-    # ========================================================
-    # ALERT CENTER
-    # ========================================================
-
-    st.markdown(
-        '<div class="section-title">🚨 Survivor Detection Center</div>',
-        unsafe_allow_html=True
-    )
-
-    if notifications:
-
-        for alert in notifications[-3:][::-1]:
-
-            st.markdown(f"""
-            <div class="survivor-alert">
-
-                <div class="alert-title">
-                    🚨 POSSIBLE SURVIVOR DETECTED
-                </div>
-
-                <div class="alert-text">
-                    AI detected a person in the drone frame.
-                    Responder verification required.
-                </div>
-
-                <div class="alert-data">
-
-                    <span class="badge badge-red">
-                        CONFIDENCE {alert["confidence"]}%
-                    </span>
-
-                    <span class="badge badge-blue">
-                        📍 {alert["latitude"]:.6f},
-                        {alert["longitude"]:.6f}
-                    </span>
-
-                    <span class="badge badge-orange">
-                        {alert["timestamp"]}
-                    </span>
-
-                </div>
-
-            </div>
-            """, unsafe_allow_html=True)
-
-    else:
-
-        st.markdown("""
-        <div class="info-card">
-
-            <div class="info-card-title">
-                🟢 NO ACTIVE SURVIVOR ALERT
-            </div>
-
-            <div class="info-card-text">
-                Upload a drone image to run AI detection.
-            </div>
-
-        </div>
-        """, unsafe_allow_html=True)
-
-
-    # ========================================================
-    # DRONE SCAN
-    # ========================================================
-
-    st.markdown(
-        '<div class="section-title">📸 Drone Scan</div>',
-        unsafe_allow_html=True
-    )
-
-    drone_file = st.file_uploader(
-        "Upload current drone image",
-        type=["jpg", "jpeg", "png"],
-        key="drone_upload"
-    )
-
-    if drone_file:
-
-        drone_image = uploaded_to_cv(
-            drone_file
+        st.map(
+            map_df,
+            zoom=14,
         )
 
-        if drone_image is not None:
+    with top_right:
 
-            preview_col, info_col = st.columns(
-                [1.4, 1]
+        st.subheader(
+            "📡 Telemetry"
+        )
+
+        telemetry_data = {
+            "Parameter": [
+                "Latitude",
+                "Longitude",
+                "Altitude",
+                "Heading",
+                "GPS Source",
+                "Timestamp",
+            ],
+            "Value": [
+                f"{gps['lat']:.6f}",
+                f"{gps['lon']:.6f}",
+                f"{gps['altitude']:.2f} m",
+                f"{gps['heading']:.2f}°",
+                gps["source"],
+                gps["timestamp"] or "N/A",
+            ],
+        }
+
+        st.dataframe(
+            pd.DataFrame(telemetry_data),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.divider()
+
+    st.subheader(
+        "📸 Coordinate-Based Drone Scan"
+    )
+
+    scan_col1, scan_col2 = st.columns(2)
+
+    with scan_col1:
+
+        coordinate_radius = st.number_input(
+            "Matching Radius (km)",
+            min_value=0.05,
+            max_value=20.0,
+            value=2.0,
+            step=0.05,
+        )
+
+    with scan_col2:
+
+        scan_type = st.selectbox(
+            "Scan Type",
+            [
+                "Post-Disaster",
+                "Pre-Disaster",
+                "Monitoring",
+            ],
+        )
+
+    drone_image_file = st.file_uploader(
+        "Upload drone image",
+        type=[
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+        ],
+        key="drone_upload",
+    )
+
+    if drone_image_file is not None:
+
+        current_drone = uploaded_to_cv(
+            drone_image_file
+        )
+
+        st.subheader(
+            "Current Drone Image"
+        )
+
+        st.image(
+            cv_to_rgb(current_drone),
+            width="stretch",
+        )
+
+        nearest = None
+
+        if scan_type == "Post-Disaster":
+
+            nearest = find_nearest_scan(
+                gps["lat"],
+                gps["lon"],
+                coordinate_radius,
+                "Pre-Disaster",
             )
 
-            with preview_col:
+        else:
 
-                st.image(
-                    cv_to_rgb(
-                        drone_image
-                    ),
-                    caption="CURRENT DRONE FRAME",
-                    width="stretch"
+            nearest = find_nearest_scan(
+                gps["lat"],
+                gps["lon"],
+                coordinate_radius,
+            )
+
+        if nearest:
+
+            distance, previous = nearest
+
+            st.info(
+                f"Nearest GPS-matched scan: "
+                f"{previous.get('scan_id')} "
+                f"at {distance:.3f} km"
+            )
+
+            previous_image_path = Path(
+                previous.get(
+                    "image_path",
+                    "",
+                )
+            )
+
+            if previous_image_path.exists():
+
+                previous_image = cv2.imread(
+                    str(previous_image_path)
                 )
 
-            with info_col:
+                if previous_image is not None:
 
-                st.markdown("""
-                <div class="info-card">
+                    with st.expander(
+                        "View matched reference scan"
+                    ):
+                        st.image(
+                            cv_to_rgb(
+                                previous_image
+                            ),
+                            width="stretch",
+                        )
 
-                    <div class="info-card-title">
-                        AI MISSION PIPELINE
-                    </div>
+            else:
+                previous_image = None
 
-                    <div class="info-card-text">
-                        01 — GPS coordinate lookup<br>
-                        02 — Geographic scan matching<br>
-                        03 — Image alignment<br>
-                        04 — Damage comparison<br>
-                        05 — YOLO object detection<br>
-                        06 — Survivor coordinate estimation<br>
-                        07 — Persistent alert generation
-                    </div>
+        else:
 
-                </div>
-                """, unsafe_allow_html=True)
+            previous_image = None
 
-            if st.button(
-                "🚀 PROCESS DRONE SCAN",
-                type="primary",
-                use_container_width=True
-            ):
+            if scan_type == "Post-Disaster":
 
-                current_hash = image_hash(
-                    drone_file
+                st.warning(
+                    "No pre-disaster scan was found "
+                    "within the selected GPS radius."
                 )
 
-                if current_hash == st.session_state.drone_last_hash:
-
-                    st.info(
-                        "This image has already been processed."
-                    )
-
-                else:
-
-                    scan_id = next_scan_id()
-
-                    image_path = save_drone_image(
-                        drone_image,
-                        scan_id
-                    )
-
-                    # ------------------------------------------
-                    # FIND BASELINE
-                    # ------------------------------------------
-
-                    previous_record = None
-                    coordinate_distance = None
-
-                    if scan_type == "Post-Disaster":
-
-                        previous_record, coordinate_distance = (
-                            find_nearest_scan(
-                                history,
-                                lat,
-                                lon,
-                                coordinate_radius,
-                                "Pre-Disaster"
-                            )
-                        )
-
-                    else:
-
-                        previous_record, coordinate_distance = (
-                            find_nearest_scan(
-                                history,
-                                lat,
-                                lon,
-                                coordinate_radius
-                            )
-                        )
-
-                    # ------------------------------------------
-                    # DAMAGE COMPARISON
-                    # ------------------------------------------
-
-                    previous_image = None
-                    damage_map = None
-                    statistics = None
-                    comparison_available = False
-                    alignment_success = False
-                    matches = 0
-
-                    if previous_record:
-
-                        previous_path = previous_record.get(
-                            "image_path"
-                        )
-
-                        if (
-                            previous_path
-                            and
-                            Path(previous_path).exists()
-                        ):
-
-                            previous_image = cv2.imread(
-                                previous_path
-                            )
-
-                            if previous_image is not None:
-
-                                aligned, alignment_success, matches = (
-                                    align_images(
-                                        previous_image,
-                                        drone_image
-                                    )
-                                )
-
-                                if alignment_success:
-
-                                    compare_image = aligned
-
-                                else:
-
-                                    compare_image = cv2.resize(
-                                        drone_image,
-                                        (
-                                            previous_image.shape[1],
-                                            previous_image.shape[0]
-                                        )
-                                    )
-
-                                difference, threshold = (
-                                    calculate_difference(
-                                        previous_image,
-                                        compare_image
-                                    )
-                                )
-
-                                damage_map = (
-                                    create_damage_map(
-                                        difference,
-                                        critical_threshold,
-                                        moderate_threshold,
-                                        low_threshold
-                                    )
-                                )
-
-                                statistics = (
-                                    damage_percentages(
-                                        difference,
-                                        critical_threshold,
-                                        moderate_threshold,
-                                        low_threshold
-                                    )
-                                )
-
-                                comparison_available = True
-
-                    # ------------------------------------------
-                    # AI
-                    # ------------------------------------------
-
-                    plotted_image, detections = run_yolo(
-                        drone_image,
-                        yolo_confidence
-                    )
-
-                    # ------------------------------------------
-                    # SURVIVOR ALERTS
-                    # ------------------------------------------
-
-                    survivor_alerts = create_survivor_alerts(
-                        detections,
-                        gps,
-                        drone_image.shape,
-                        hfov,
-                        vfov,
-                        scan_id
-                    )
-
-                    for alert in survivor_alerts:
-
-                        save_notification(
-                            alert
-                        )
-
-                    # ------------------------------------------
-                    # SAVE RESULTS
-                    # ------------------------------------------
-
-                    ai_path = save_result_image(
-                        plotted_image,
-                        scan_id,
-                        "ai"
-                    )
-
-                    damage_path = None
-
-                    if damage_map is not None:
-
-                        damage_path = save_result_image(
-                            damage_map,
-                            scan_id,
-                            "damage"
-                        )
-
-                    # ------------------------------------------
-                    # RECORD
-                    # ------------------------------------------
-
-                    record = {
-
-                        "scan_id":
-                            scan_id,
-
-                        "timestamp":
-                            now_string(),
-
-                        "image_path":
-                            image_path,
-
-                        "ai_image_path":
-                            ai_path,
-
-                        "damage_map_path":
-                            damage_path,
-
-                        "latitude":
-                            round(lat, 7),
-
-                        "longitude":
-                            round(lon, 7),
-
-                        "altitude":
-                            round(alt, 2),
-
-                        "heading":
-                            round(heading, 2),
-
-                        "gps_source":
-                            gps["source"],
-
-                        "scan_type":
-                            scan_type,
-
-                        "compared_with":
-                            previous_record[
-                                "scan_id"
-                            ]
-                            if previous_record
-                            else None,
-
-                        "coordinate_distance_m":
-                            round(
-                                coordinate_distance,
-                                2
-                            )
-                            if coordinate_distance is not None
-                            else None,
-
-                        "coordinate_match":
-                            previous_record is not None,
-
-                        "comparison_available":
-                            comparison_available,
-
-                        "alignment_success":
-                            alignment_success,
-
-                        "feature_matches":
-                            matches,
-
-                        "statistics":
-                            statistics,
-
-                        "detections":
-                            detections,
-
-                        "survivor_alerts":
-                            survivor_alerts,
-
-                        "image_hash":
-                            current_hash
-                    }
-
-                    save_drone_record(
-                        record
-                    )
-
-                    st.session_state.drone_history = (
-                        load_drone_history()
-                    )
-
-                    st.session_state.drone_last_hash = (
-                        current_hash
-                    )
-
-                    st.session_state.drone_current_analysis = {
-
-                        "record":
-                            record,
-
-                        "current":
-                            drone_image,
-
-                        "previous":
-                            previous_image,
-
-                        "damage_map":
-                            damage_map,
-
-                        "ai_image":
-                            plotted_image
-                    }
-
-                    if survivor_alerts:
-
-                        st.error(
-                            f"🚨 {len(survivor_alerts)} "
-                            "possible survivor alert(s) generated."
-                        )
-
-                    else:
-
-                        st.success(
-                            "🟢 No person detected."
-                        )
-
-                    if comparison_available:
-
-                        st.success(
-                            f"📍 GPS matched with "
-                            f"{previous_record['scan_id']} "
-                            f"({coordinate_distance:.2f} m)"
-                        )
-
-                    else:
-
-                        st.warning(
-                            f"📍 No baseline scan within "
-                            f"{coordinate_radius} m."
-                        )
-
-
-    # ========================================================
-    # LATEST RESULT
-    # ========================================================
-
-    analysis = (
-        st.session_state.drone_current_analysis
-    )
-
-    if analysis:
-
-        st.markdown(
-            '<div class="section-title">📊 Latest Mission Result</div>',
-            unsafe_allow_html=True
+            else:
+
+                st.info(
+                    "No nearby reference scan found."
+                )
+
+        process_drone = st.button(
+            "🚀 PROCESS DRONE SCAN",
+            type="primary",
+            width="stretch",
         )
 
-        c1, c2, c3 = st.columns(3)
+        if process_drone:
 
-        with c1:
+            scan_id = make_scan_id(
+                "SCAN"
+            )
 
-            st.image(
-                cv_to_rgb(
-                    analysis["current"]
+            # ----------------------------------------
+            # DAMAGE COMPARISON
+            # ----------------------------------------
+
+            damage_map = None
+            damage_stats = None
+            diff = None
+            markers = []
+
+            if previous_image is not None:
+
+                reference, current = resize_same(
+                    previous_image,
+                    current_drone,
+                )
+
+                damage_map, diff = create_damage_map(
+                    reference,
+                    current,
+                    critical_threshold,
+                    moderate_threshold,
+                    low_threshold,
+                )
+
+                if diff is not None:
+
+                    damage_stats = damage_statistics(
+                        diff,
+                        critical_threshold,
+                        moderate_threshold,
+                        low_threshold,
+                    )
+
+                    damage_map, markers = add_damage_markers(
+                        damage_map,
+                        diff,
+                        low_threshold,
+                    )
+
+            # ----------------------------------------
+            # YOLO
+            # ----------------------------------------
+
+            yolo_image, detections = run_yolo(
+                current_drone,
+                yolo_confidence,
+            )
+
+            # ----------------------------------------
+            # SURVIVOR ALERTS
+            # ----------------------------------------
+
+            alerts = create_survivor_alerts(
+                detections,
+                current_drone.shape,
+                gps,
+                scan_id,
+                estimate_survivor_position,
+                hfov,
+                vfov,
+            )
+
+            add_alerts(alerts)
+
+            # ----------------------------------------
+            # SAVE IMAGE
+            # ----------------------------------------
+
+            image_path = (
+                SCANS_DIR
+                / f"{scan_id}.jpg"
+            )
+
+            cv2.imwrite(
+                str(image_path),
+                current_drone,
+            )
+
+            result_path = None
+
+            if damage_map is not None:
+
+                result_path = (
+                    RESULTS_DIR
+                    / f"{scan_id}_damage.jpg"
+                )
+
+                cv2.imwrite(
+                    str(result_path),
+                    damage_map,
+                )
+
+            # ----------------------------------------
+            # SAVE SCAN RECORD
+            # ----------------------------------------
+
+            record = {
+                "scan_id": scan_id,
+                "timestamp": now_string(),
+                "scan_type": scan_type,
+                "lat": gps["lat"],
+                "lon": gps["lon"],
+                "altitude": gps["altitude"],
+                "heading": gps["heading"],
+                "gps_source": gps["source"],
+                "image_path": str(
+                    image_path
                 ),
-                caption="CURRENT SCAN",
-                width="stretch"
+                "result_path": (
+                    str(result_path)
+                    if result_path
+                    else None
+                ),
+                "reference_scan_id": (
+                    previous.get("scan_id")
+                    if nearest
+                    else None
+                ),
+                "reference_distance_km": (
+                    round(
+                        nearest[0],
+                        4,
+                    )
+                    if nearest
+                    else None
+                ),
+                "damage_statistics": damage_stats,
+                "detection_count": len(
+                    detections
+                ),
+                "survivor_alert_count": len(
+                    alerts
+                ),
+            }
+
+            save_scan_record(record)
+
+            # ----------------------------------------
+            # STORE RESULT IN SESSION
+            # ----------------------------------------
+
+            st.session_state.last_drone_result = {
+                "scan_id": scan_id,
+                "timestamp": record["timestamp"],
+                "damage_map": damage_map,
+                "diff": diff,
+                "damage_stats": damage_stats,
+                "detections": detections,
+                "alerts": alerts,
+                "yolo_image": yolo_image,
+                "markers": markers,
+                "record": record,
+            }
+
+            st.success(
+                f"Scan {scan_id} processed successfully."
             )
 
-        with c2:
-
-            if analysis["previous"] is not None:
-
-                st.image(
-                    cv_to_rgb(
-                        analysis["previous"]
-                    ),
-                    caption="GPS MATCHED BASELINE",
-                    width="stretch"
+            if alerts:
+                st.warning(
+                    f"🚨 {len(alerts)} possible survivor/person "
+                    f"detection(s) generated."
+                )
+            else:
+                st.info(
+                    "No person detections were generated."
                 )
 
-            else:
+    # ========================================================
+    # LATEST DRONE RESULT
+    # ========================================================
 
-                st.markdown("""
-                <div class="info-card">
+    result = st.session_state.last_drone_result
 
-                    <div class="info-card-title">
-                        NO BASELINE
-                    </div>
+    if result:
 
-                    <div class="info-card-text">
-                        No previous scan was found
-                        inside the selected GPS radius.
-                    </div>
+        st.divider()
 
-                </div>
-                """, unsafe_allow_html=True)
+        st.header(
+            "📊 Latest Mission Result"
+        )
 
-        with c3:
+        r1, r2, r3 = st.columns(3)
 
-            if analysis["damage_map"] is not None:
-
-                st.image(
-                    cv_to_rgb(
-                        analysis["damage_map"]
-                    ),
-                    caption="DAMAGE MAP",
-                    width="stretch"
-                )
-
-            else:
-
-                st.markdown("""
-                <div class="info-card">
-
-                    <div class="info-card-title">
-                        GPS BASELINE REQUIRED
-                    </div>
-
-                    <div class="info-card-text">
-                        Damage comparison will appear
-                        when a geographic baseline exists.
-                    </div>
-
-                </div>
-                """, unsafe_allow_html=True)
-
-        record = analysis["record"]
-
-        if record.get("statistics"):
-
-            stats = record["statistics"]
-
-            st.markdown(
-                '<div class="section-title">📈 Damage Distribution</div>',
-                unsafe_allow_html=True
+        with r1:
+            st.metric(
+                "Scan ID",
+                result["scan_id"],
             )
 
-            a, b, c, d = st.columns(4)
+        with r2:
+            st.metric(
+                "AI Detections",
+                len(
+                    result["detections"]
+                ),
+            )
 
-            for col, label in zip(
-                [a, b, c, d],
-                [
-                    "Critical",
-                    "Moderate",
-                    "Low",
-                    "Safe"
-                ]
-            ):
+        with r3:
+            st.metric(
+                "Possible Survivors",
+                len(
+                    result["alerts"]
+                ),
+            )
 
-                with col:
+        if result["damage_stats"]:
 
-                    st.markdown(f"""
-                    <div class="kpi-card">
+            st.subheader(
+                "🔥 Damage Distribution"
+            )
 
-                        <div class="kpi-label">
-                            {label}
-                        </div>
+            stats = result[
+                "damage_stats"
+            ]
 
-                        <div class="kpi-value">
-                            {stats[label]}%
-                        </div>
-
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            chart_df = pd.DataFrame({
-                "Damage Level":
-                    list(stats.keys()),
-
-                "Area %":
-                    list(stats.values())
-            })
+            chart_df = pd.DataFrame(
+                {
+                    "Damage Class": list(
+                        stats.keys()
+                    ),
+                    "Area (%)": list(
+                        stats.values()
+                    ),
+                }
+            )
 
             st.bar_chart(
                 chart_df.set_index(
-                    "Damage Level"
+                    "Damage Class"
                 )
             )
 
-        detections = record.get(
-            "detections",
-            []
-        )
+            d1, d2, d3, d4 = st.columns(4)
 
-        if detections:
+            d1.metric(
+                "🔴 Critical",
+                f"{stats['Critical']}%",
+            )
 
-            st.markdown(
-                '<div class="section-title">🤖 AI Detections</div>',
-                unsafe_allow_html=True
+            d2.metric(
+                "🟠 Moderate",
+                f"{stats['Moderate']}%",
+            )
+
+            d3.metric(
+                "🟡 Low",
+                f"{stats['Low']}%",
+            )
+
+            d4.metric(
+                "🟢 Safe",
+                f"{stats['Safe']}%",
+            )
+
+        else:
+
+            st.info(
+                "No GPS-matched reference image was "
+                "available for damage comparison."
+            )
+
+        image_col1, image_col2 = st.columns(2)
+
+        with image_col1:
+
+            if result["damage_map"] is not None:
+
+                st.subheader(
+                    "🗺️ Damage Map"
+                )
+
+                st.image(
+                    cv_to_rgb(
+                        result["damage_map"]
+                    ),
+                    width="stretch",
+                )
+
+        with image_col2:
+
+            if result["yolo_image"] is not None:
+
+                st.subheader(
+                    "🤖 AI Detection"
+                )
+
+                st.image(
+                    cv_to_rgb(
+                        result["yolo_image"]
+                    ),
+                    width="stretch",
+                )
+
+        if result["detections"]:
+
+            st.subheader(
+                "🤖 Detection Table"
             )
 
             st.dataframe(
-                pd.DataFrame(detections),
+                pd.DataFrame(
+                    result["detections"]
+                ),
                 width="stretch",
-                hide_index=True
+                hide_index=True,
             )
 
+        if result["alerts"]:
+
+            st.subheader(
+                "🚨 Survivor Alerts"
+            )
+
+            alert_df = pd.DataFrame(
+                result["alerts"]
+            )
+
+            st.dataframe(
+                alert_df,
+                width="stretch",
+                hide_index=True,
+            )
+
+        if result["markers"]:
+
+            st.caption(
+                f"{len(result['markers'])} damage regions "
+                "identified for responder attention."
+            )
 
     # ========================================================
     # SCAN HISTORY
     # ========================================================
 
-    st.markdown(
-        '<div class="section-title">🗂️ Coordinate-Based Scan History</div>',
-        unsafe_allow_html=True
+    st.divider()
+
+    st.subheader(
+        "📚 GPS Scan History"
     )
 
-    if history:
+    scan_history = load_scan_history()
+
+    if scan_history:
 
         rows = []
 
-        for record in reversed(history):
+        for scan in scan_history[:25]:
 
-            rows.append({
-
-                "Scan":
-                    record.get(
+            rows.append(
+                {
+                    "Scan ID": scan.get(
                         "scan_id"
                     ),
-
-                "Time":
-                    record.get(
-                        "timestamp"
-                    ),
-
-                "Type":
-                    record.get(
+                    "Type": scan.get(
                         "scan_type"
                     ),
-
-                "Latitude":
-                    record.get(
-                        "latitude"
+                    "Latitude": scan.get(
+                        "lat"
                     ),
-
-                "Longitude":
-                    record.get(
-                        "longitude"
+                    "Longitude": scan.get(
+                        "lon"
                     ),
-
-                "Compared With":
-                    record.get(
-                        "compared_with"
-                    )
-                    or "—",
-
-                "GPS Distance":
-                    record.get(
-                        "coordinate_distance_m"
-                    )
-                    or "—",
-
-                "GPS Match":
-                    "YES"
-                    if record.get(
-                        "coordinate_match"
-                    )
-                    else "NO",
-
-                "Alerts":
-                    len(
-                        record.get(
-                            "survivor_alerts",
-                            []
-                        )
-                    )
-            })
+                    "Reference": scan.get(
+                        "reference_scan_id"
+                    ),
+                    "Alerts": scan.get(
+                        "survivor_alert_count",
+                        0,
+                    ),
+                    "Time": scan.get(
+                        "timestamp"
+                    ),
+                }
+            )
 
         st.dataframe(
             pd.DataFrame(rows),
             width="stretch",
-            hide_index=True
+            hide_index=True,
         )
 
     else:
 
         st.info(
-            "No drone scans recorded yet."
+            "No scans have been indexed yet."
         )
 
 
 # ============================================================
-# TAB 2 — SATELLITE
+# SATELLITE ANALYSIS
 # ============================================================
 
-with tab2:
+with tab_satellite:
 
-    st.markdown(
-        '<div class="section-title">🗺️ Satellite Damage Analysis</div>',
-        unsafe_allow_html=True
+    st.header(
+        "🗺️ Satellite Pre/Post Analysis"
     )
 
-    st.markdown(
-        '<div class="section-caption">'
-        'Compare pre-disaster and post-disaster imagery'
-        '</div>',
-        unsafe_allow_html=True
+    st.caption(
+        "Compare two images from the same location "
+        "to estimate disaster-related visual change."
     )
 
-    use_gps = st.checkbox(
-        "📍 Validate image coordinates",
-        False
-    )
+    sat_col1, sat_col2 = st.columns(2)
 
-    if use_gps:
+    with sat_col1:
 
-        g1, g2 = st.columns(2)
+        satellite_pre = st.file_uploader(
+            "Pre-disaster satellite image",
+            type=[
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+            ],
+            key="sat_pre",
+        )
 
-        with g1:
+    with sat_col2:
 
-            pre_lat = st.number_input(
-                "Pre Latitude",
-                value=23.2599,
-                format="%.7f"
+        satellite_post = st.file_uploader(
+            "Post-disaster satellite image",
+            type=[
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+            ],
+            key="sat_post",
+        )
+
+    if satellite_pre and satellite_post:
+
+        pre_image = uploaded_to_cv(
+            satellite_pre
+        )
+
+        post_image = uploaded_to_cv(
+            satellite_post
+        )
+
+        s1, s2 = st.columns(2)
+
+        with s1:
+            st.image(
+                cv_to_rgb(pre_image),
+                caption="Pre-Disaster",
+                width="stretch",
             )
 
-            pre_lon = st.number_input(
-                "Pre Longitude",
-                value=77.4126,
-                format="%.7f"
+        with s2:
+            st.image(
+                cv_to_rgb(post_image),
+                caption="Post-Disaster",
+                width="stretch",
             )
 
-        with g2:
-
-            post_lat = st.number_input(
-                "Post Latitude",
-                value=23.2599,
-                format="%.7f"
-            )
-
-            post_lon = st.number_input(
-                "Post Longitude",
-                value=77.4126,
-                format="%.7f"
-            )
-
-        satellite_radius = st.number_input(
-            "Allowed GPS Difference (m)",
-            5,
-            5000,
-            100
-        )
-
-    s1, s2 = st.columns(2)
-
-    with s1:
-
-        pre_file = st.file_uploader(
-            "PRE-DISASTER IMAGE",
-            type=["jpg", "jpeg", "png"],
-            key="pre_upload"
-        )
-
-    with s2:
-
-        post_file = st.file_uploader(
-            "POST-DISASTER IMAGE",
-            type=["jpg", "jpeg", "png"],
-            key="post_upload"
-        )
-
-    if pre_file and post_file:
-
-        pre_img = uploaded_to_cv(
-            pre_file
-        )
-
-        post_img = uploaded_to_cv(
-            post_file
-        )
-
-        if st.button(
-            "🔎 ANALYZE DAMAGE",
+        analyze_satellite = st.button(
+            "🛰️ ANALYZE SATELLITE CHANGE",
             type="primary",
-            use_container_width=True
-        ):
+            width="stretch",
+        )
 
-            if use_gps:
+        if analyze_satellite:
 
-                distance = haversine_m(
-                    pre_lat,
-                    pre_lon,
-                    post_lat,
-                    post_lon
-                )
-
-                if distance > satellite_radius:
-
-                    st.error(
-                        f"Images are {distance:.2f} m apart."
-                    )
-
-                else:
-
-                    st.success(
-                        f"GPS validated — {distance:.2f} m"
-                    )
-
-            result = None
-
-            aligned, success, matches = align_images(
-                pre_img,
-                post_img
+            reference, current = resize_same(
+                pre_image,
+                post_image,
             )
 
-            if success:
-
-                compare = aligned
-
-            else:
-
-                compare = cv2.resize(
-                    post_img,
-                    (
-                        pre_img.shape[1],
-                        pre_img.shape[0]
-                    )
-                )
-
-            difference, threshold = (
-                calculate_difference(
-                    pre_img,
-                    compare
-                )
-            )
-
-            damage_map = create_damage_map(
-                difference,
+            damage_map, diff = create_damage_map(
+                reference,
+                current,
                 critical_threshold,
                 moderate_threshold,
-                low_threshold
+                low_threshold,
             )
 
-            stats = damage_percentages(
-                difference,
-                critical_threshold,
-                moderate_threshold,
-                low_threshold
-            )
+            if diff is not None:
 
-            st.session_state.satellite_result = {
+                stats = damage_statistics(
+                    diff,
+                    critical_threshold,
+                    moderate_threshold,
+                    low_threshold,
+                )
 
-                "pre":
-                    pre_img,
+                st.session_state.last_satellite_result = {
+                    "damage_map": damage_map,
+                    "diff": diff,
+                    "stats": stats,
+                }
 
-                "post":
-                    compare,
+    satellite_result = (
+        st.session_state.last_satellite_result
+    )
 
-                "damage_map":
-                    damage_map,
+    if satellite_result:
 
-                "stats":
-                    stats,
+        st.divider()
 
-                "success":
-                    success,
+        st.subheader(
+            "📊 Satellite Damage Assessment"
+        )
 
-                "matches":
-                    matches
+        stats = satellite_result[
+            "stats"
+        ]
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "🔴 Critical",
+            f"{stats['Critical']}%",
+        )
+
+        c2.metric(
+            "🟠 Moderate",
+            f"{stats['Moderate']}%",
+        )
+
+        c3.metric(
+            "🟡 Low",
+            f"{stats['Low']}%",
+        )
+
+        c4.metric(
+            "🟢 Safe",
+            f"{stats['Safe']}%",
+        )
+
+        chart_df = pd.DataFrame(
+            {
+                "Class": list(
+                    stats.keys()
+                ),
+                "Area (%)": list(
+                    stats.values()
+                ),
             }
-
-    result = st.session_state.satellite_result
-
-    if result:
-
-        st.markdown(
-            '<div class="section-title">🛰️ Analysis Output</div>',
-            unsafe_allow_html=True
         )
-
-        a, b, c = st.columns(3)
-
-        with a:
-
-            st.image(
-                cv_to_rgb(result["pre"]),
-                caption="PRE-DISASTER",
-                width="stretch"
-            )
-
-        with b:
-
-            st.image(
-                cv_to_rgb(result["post"]),
-                caption="POST-DISASTER",
-                width="stretch"
-            )
-
-        with c:
-
-            st.image(
-                cv_to_rgb(result["damage_map"]),
-                caption="DAMAGE CLASSIFICATION",
-                width="stretch"
-            )
-
-        if result["success"]:
-
-            st.success(
-                f"Image alignment successful — "
-                f"{result['matches']} feature matches"
-            )
-
-        else:
-
-            st.warning(
-                "Automatic image alignment was not reliable."
-            )
-
-        stats = result["stats"]
-
-        st.markdown(
-            '<div class="section-title">📊 Damage Distribution</div>',
-            unsafe_allow_html=True
-        )
-
-        p1, p2, p3, p4 = st.columns(4)
-
-        for col, label in zip(
-            [p1, p2, p3, p4],
-            [
-                "Critical",
-                "Moderate",
-                "Low",
-                "Safe"
-            ]
-        ):
-
-            with col:
-
-                st.markdown(f"""
-                <div class="kpi-card">
-
-                    <div class="kpi-label">
-                        {label}
-                    </div>
-
-                    <div class="kpi-value">
-                        {stats[label]}%
-                    </div>
-
-                </div>
-                """, unsafe_allow_html=True)
-
-        chart_df = pd.DataFrame({
-            "Damage Level":
-                list(stats.keys()),
-
-            "Area %":
-                list(stats.values())
-        })
 
         st.bar_chart(
             chart_df.set_index(
-                "Damage Level"
+                "Class"
             )
+        )
+
+        st.subheader(
+            "🗺️ Generated Damage Map"
+        )
+
+        st.image(
+            cv_to_rgb(
+                satellite_result[
+                    "damage_map"
+                ]
+            ),
+            width="stretch",
         )
 
 
 # ============================================================
-# TAB 3 — CAMERA AI
+# CAMERA AI
 # ============================================================
 
-with tab3:
+with tab_camera:
 
-    st.markdown(
-        '<div class="section-title">📷 Camera AI Detection</div>',
-        unsafe_allow_html=True
+    st.header(
+        "📷 Camera AI"
     )
 
-    st.markdown(
-        '<div class="section-caption">'
-        'Capture a disaster scene and run AI object detection'
-        '</div>',
-        unsafe_allow_html=True
+    st.caption(
+        "Capture an image and run AI object/person detection."
     )
 
     camera_image = st.camera_input(
@@ -3225,240 +2237,296 @@ with tab3:
             camera_image
         )
 
-        if image is not None:
+        st.subheader(
+            "Captured Image"
+        )
 
-            st.image(
-                cv_to_rgb(image),
-                caption="CAPTURED SCENE",
-                width="stretch"
+        st.image(
+            cv_to_rgb(image),
+            width="stretch",
+        )
+
+        analyze_camera = st.button(
+            "🤖 RUN CAMERA AI",
+            type="primary",
+            width="stretch",
+        )
+
+        if analyze_camera:
+
+            camera_id = make_scan_id(
+                "CAM"
             )
 
-            if st.button(
-                "🤖 RUN AI DETECTION",
-                type="primary",
-                use_container_width=True
-            ):
+            yolo_image, detections = run_yolo(
+                image,
+                yolo_confidence,
+            )
 
-                output, detections = run_yolo(
-                    image,
-                    yolo_confidence
-                )
+            alerts = create_survivor_alerts(
+                detections,
+                image.shape,
+                gps,
+                camera_id,
+                estimate_survivor_position,
+                hfov,
+                vfov,
+            )
 
-                st.image(
-                    cv_to_rgb(output),
-                    caption="AI DETECTION RESULT",
-                    width="stretch"
-                )
+            add_alerts(alerts)
 
-                if detections:
+            st.session_state.last_camera_result = {
+                "image": yolo_image,
+                "detections": detections,
+                "alerts": alerts,
+            }
 
-                    st.dataframe(
-                        pd.DataFrame(detections),
-                        width="stretch",
-                        hide_index=True
-                    )
-
-                    persons = sum(
-                        1
-                        for d in detections
-                        if d["category"]
-                        ==
-                        "Possible Survivor"
-                    )
-
-                    if persons:
-
-                        st.error(
-                            f"🚨 {persons} possible "
-                            "survivor/person detection(s)"
-                        )
-
-                    else:
-
-                        st.success(
-                            "No person detected."
-                        )
-
-                else:
-
-                    st.info(
-                        "No objects detected."
-                    )
-
-
-# ============================================================
-# TAB 4 — ALERT HISTORY
-# ============================================================
-
-with tab4:
-
-    st.markdown(
-        '<div class="section-title">🔔 Mission Alert History</div>',
-        unsafe_allow_html=True
+    camera_result = (
+        st.session_state.last_camera_result
     )
 
-    st.markdown(
-        '<div class="section-caption">'
-        'Persistent AI-generated survivor/person alerts'
-        '</div>',
-        unsafe_allow_html=True
+    if camera_result:
+
+        st.divider()
+
+        if camera_result["image"] is not None:
+
+            st.subheader(
+                "🤖 AI Detection Result"
+            )
+
+            st.image(
+                cv_to_rgb(
+                    camera_result["image"]
+                ),
+                width="stretch",
+            )
+
+        detections = camera_result[
+            "detections"
+        ]
+
+        alerts = camera_result[
+            "alerts"
+        ]
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.metric(
+                "AI Detections",
+                len(detections),
+            )
+
+        with c2:
+            st.metric(
+                "🚨 Possible Survivors",
+                len(alerts),
+            )
+
+        if detections:
+
+            st.subheader(
+                "Detection Results"
+            )
+
+            st.dataframe(
+                pd.DataFrame(detections),
+                width="stretch",
+                hide_index=True,
+            )
+
+        if alerts:
+
+            st.error(
+                f"🚨 {len(alerts)} possible survivor/person "
+                "alert(s) generated."
+            )
+
+            st.dataframe(
+                pd.DataFrame(alerts),
+                width="stretch",
+                hide_index=True,
+            )
+
+        else:
+
+            st.success(
+                "No person detection was generated."
+            )
+
+
+# ============================================================
+# ALERT HISTORY
+# ============================================================
+
+with tab_alerts:
+
+    st.header(
+        "🔔 Mission Alert History"
+    )
+
+    st.caption(
+        "Persistent AI-generated survivor/person alerts"
     )
 
     notifications = load_notifications()
 
-    st.session_state.notifications = notifications
+    if not notifications:
 
-    if notifications:
+        st.info(
+            "🔔 No alerts have been generated yet."
+        )
+
+        st.caption(
+            "Run a drone scan or Camera AI analysis "
+            "with a person detection to generate an alert."
+        )
+
+    else:
 
         latest = notifications[-1]
 
-        st.markdown(f"""
-        <div class="survivor-alert">
-
-            <div class="alert-title">
-                🚨 LATEST SURVIVOR ALERT
-            </div>
-
-            <div class="alert-text">
-                Person detected by AI
-            </div>
-
-            <div class="alert-data">
-
-                <span class="badge badge-red">
-                    {latest["confidence"]}% CONFIDENCE
-                </span>
-
-                <span class="badge badge-blue">
-                    📍 {latest["latitude"]:.6f},
-                    {latest["longitude"]:.6f}
-                </span>
-
-                <span class="badge badge-orange">
-                    {latest["timestamp"]}
-                </span>
-
-            </div>
-
-        </div>
-        """, unsafe_allow_html=True)
-
-        rows = []
-
-        for alert in reversed(
-            notifications
-        ):
-
-            rows.append({
-
-                "Time":
-                    alert.get(
-                        "timestamp"
-                    ),
-
-                "Alert":
-                    alert.get(
-                        "message"
-                    ),
-
-                "Latitude":
-                    alert.get(
-                        "latitude"
-                    ),
-
-                "Longitude":
-                    alert.get(
-                        "longitude"
-                    ),
-
-                "Altitude":
-                    alert.get(
-                        "altitude"
-                    ),
-
-                "Confidence":
-                    f'{alert.get("confidence", 0)}%',
-
-                "Scan":
-                    alert.get(
-                        "scan_id"
-                    )
-            })
-
-        st.dataframe(
-            pd.DataFrame(rows),
-            width="stretch",
-            hide_index=True
+        st.subheader(
+            "🚨 Latest Alert"
         )
 
-        st.markdown(
-            '<div class="section-title">📍 Alert Locations</div>',
-            unsafe_allow_html=True
+        l1, l2, l3, l4 = st.columns(4)
+
+        l1.metric(
+            "Alert Type",
+            latest.get(
+                "type",
+                "Unknown",
+            ),
         )
 
-        alert_points = []
+        l2.metric(
+            "Confidence",
+            f"{latest.get('confidence', 0) * 100:.1f}%",
+        )
+
+        l3.metric(
+            "Latitude",
+            f"{latest.get('latitude', 0):.6f}",
+        )
+
+        l4.metric(
+            "Longitude",
+            f"{latest.get('longitude', 0):.6f}",
+        )
+
+        st.divider()
+
+        st.subheader(
+            "🗺️ Alert Locations"
+        )
+
+        map_rows = []
 
         for alert in notifications:
 
             if (
                 alert.get("latitude")
                 is not None
-                and
-                alert.get("longitude")
+                and alert.get("longitude")
                 is not None
             ):
 
-                alert_points.append({
+                map_rows.append(
+                    {
+                        "lat": alert[
+                            "latitude"
+                        ],
+                        "lon": alert[
+                            "longitude"
+                        ],
+                    }
+                )
 
-                    "latitude":
-                        alert["latitude"],
-
-                    "longitude":
-                        alert["longitude"]
-                })
-
-        if alert_points:
+        if map_rows:
 
             st.map(
-                pd.DataFrame(alert_points),
-                height=430
+                pd.DataFrame(map_rows),
+                zoom=12,
             )
 
-    else:
+        st.divider()
 
-        st.markdown("""
-        <div class="info-card">
+        st.subheader(
+            "📋 Alert Log"
+        )
 
-            <div class="info-card-title">
-                🔔 NO ALERTS
-            </div>
+        alert_rows = []
 
-            <div class="info-card-text">
-                No AI survivor alerts have been generated yet.
-            </div>
+        for alert in reversed(
+            notifications[-100:]
+        ):
 
-        </div>
-        """, unsafe_allow_html=True)
+            alert_rows.append(
+                {
+                    "Alert ID": alert.get(
+                        "alert_id"
+                    ),
+                    "Type": alert.get(
+                        "type"
+                    ),
+                    "Confidence": (
+                        f"{alert.get('confidence', 0) * 100:.1f}%"
+                    ),
+                    "Latitude": alert.get(
+                        "latitude"
+                    ),
+                    "Longitude": alert.get(
+                        "longitude"
+                    ),
+                    "Scan ID": alert.get(
+                        "scan_id"
+                    ),
+                    "GPS Source": alert.get(
+                        "gps_source"
+                    ),
+                    "Timestamp": alert.get(
+                        "timestamp"
+                    ),
+                }
+            )
+
+        st.dataframe(
+            pd.DataFrame(alert_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+        if st.button(
+            "🗑️ Clear Alert History",
+        ):
+
+            save_notifications([])
+
+            st.session_state.notifications = []
+
+            st.success(
+                "Alert history cleared."
+            )
+
+            st.rerun()
 
 
 # ============================================================
-# FOOTER
+# FOOTER / DISCLAIMER
 # ============================================================
 
-st.markdown("""
-<div class="footer">
+st.divider()
 
-    DISASTER RESPONSE COMMAND CENTER
-    &nbsp;•&nbsp;
-    AI DAMAGE INTELLIGENCE
-    &nbsp;•&nbsp;
-    GPS RESPONSE TRACKING
+st.caption(
+    "Prototype system • Damage classification is an AI/computer-vision "
+    "estimate and should be validated by trained responders and "
+    "appropriate geospatial/RF/field instrumentation before operational use."
+)
 
-    <br><br>
-
-    Research & demonstration prototype
-    •
-    AI person detection requires human verification
-
-</div>
-""", unsafe_allow_html=True)
+st.caption(
+    f"System time: {now_string()}  •  "
+    f"Scans: {len(load_scan_history())}  •  "
+    f"Alerts: {len(load_notifications())}"
+)
