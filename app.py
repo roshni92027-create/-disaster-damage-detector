@@ -1,3 +1,4 @@
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -5,6 +6,9 @@ import pandas as pd
 from PIL import Image
 from io import BytesIO
 from pathlib import Path
+import json
+import hashlib
+from datetime import datetime
 
 # Optional AI detector. The app still works for satellite analysis if Ultralytics is unavailable.
 try:
@@ -42,7 +46,7 @@ st.markdown("""
 st.markdown("""
 <div class="hero">
 <h1>🚨 Disaster Damage Detector</h1>
-<p>Satellite change detection + AI camera assessment + line/crack analysis + responder mapping</p>
+<p>Satellite change detection + AI camera assessment + responder mapping</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -56,6 +60,15 @@ if "satellite_result" not in st.session_state:
 
 if "camera_result" not in st.session_state:
     st.session_state.camera_result = None
+
+if "drone_history" not in st.session_state:
+    st.session_state.drone_history = None
+
+if "drone_last_hash" not in st.session_state:
+    st.session_state.drone_last_hash = None
+
+if "drone_current_analysis" not in st.session_state:
+    st.session_state.drone_current_analysis = None
 
 
 # ============================================================
@@ -79,6 +92,81 @@ def resize_images(img1, img2):
         cv2.resize(img1, (w, h)),
         cv2.resize(img2, (w, h)),
     )
+
+
+# ============================================================
+# DRONE SCAN HISTORY / PERSISTENCE
+# ============================================================
+
+DRONE_ROOT = Path("drone_history")
+DRONE_SCANS = DRONE_ROOT / "scans"
+DRONE_RESULTS = DRONE_ROOT / "results"
+DRONE_SCANS.mkdir(parents=True, exist_ok=True)
+DRONE_RESULTS.mkdir(parents=True, exist_ok=True)
+
+
+def drone_image_hash(uploaded_file):
+    return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+
+
+def load_drone_history():
+    records = []
+    for path in sorted(DRONE_RESULTS.glob("scan_*.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            records.append(json.loads(path.read_text()))
+        except Exception:
+            continue
+    return records
+
+
+def save_drone_image(image, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), image)
+
+
+def save_drone_record(record):
+    path = DRONE_RESULTS / f"{record['scan_id']}.json"
+    path.write_text(json.dumps(record, indent=2))
+    return path
+
+
+def drone_damage_summary(percentages):
+    affected = percentages["Low Damage"] + percentages["Moderate Damage"] + percentages["Critical"]
+    return {
+        "Safe": round(float(percentages["Safe"]), 2),
+        "Low Damage": round(float(percentages["Low Damage"]), 2),
+        "Moderate Damage": round(float(percentages["Moderate Damage"]), 2),
+        "Critical": round(float(percentages["Critical"]), 2),
+        "Affected Area": round(float(affected), 2),
+    }
+
+
+def analyze_drone_scan(current_image, previous_record, low, moderate, critical, minimum_area, responder_points, show_responders):
+    current = current_image.copy()
+
+    if previous_record is None:
+        difference = np.zeros(current.shape[:2], dtype=np.uint8)
+        damage_map = np.zeros_like(current)
+        damage_map[:, :] = (0, 170, 0)
+        percentages = {"Safe": 100.0, "Low Damage": 0.0, "Moderate Damage": 0.0, "Critical": 0.0}
+        return {"current": current, "previous": None, "difference": difference, "damage_map": damage_map, "percentages": percentages, "aligned": False, "matches": 0, "baseline": True}
+
+    previous_path = Path(previous_record["image_path"])
+    if not previous_path.exists():
+        return analyze_drone_scan(current, None, low, moderate, critical, minimum_area, responder_points, show_responders)
+
+    previous = cv2.imread(str(previous_path))
+    if previous is None:
+        return analyze_drone_scan(current, None, low, moderate, critical, minimum_area, responder_points, show_responders)
+
+    previous, current = resize_images(previous, current)
+    aligned_current, aligned, matches = align_images(previous, current)
+    difference = calculate_difference(previous, aligned_current)
+    damage_map = create_damage_map(difference, low, moderate, critical, minimum_area)
+    if show_responders:
+        damage_map = add_responder_markers(damage_map, responder_points)
+    percentages = damage_percentages(difference, low, moderate, critical)
+    return {"current": current, "previous": aligned_current, "difference": difference, "damage_map": damage_map, "percentages": percentages, "aligned": aligned, "matches": matches, "baseline": False}
 
 
 # ============================================================
@@ -179,9 +267,9 @@ def create_damage_map(
     critical_mask = difference >= critical
 
     # BGR
-    result[low_mask] = (0, 255, 255)
-    result[moderate_mask] = (0, 140, 255)
-    result[critical_mask] = (0, 0, 255)
+    result[low_mask] = (0, 255, 255)       # yellow
+    result[moderate_mask] = (0, 140, 255)  # orange
+    result[critical_mask] = (0, 0, 255)   # red
 
     binary = np.zeros_like(difference)
     binary[difference >= low] = 255
@@ -224,7 +312,7 @@ def create_damage_map(
                 result, [contour], -1, (0, 255, 255), -1
             )
 
-    # Filled critical circles
+    # Filled critical circles as requested
     for contour in critical_contours:
         (x, y), radius = cv2.minEnclosingCircle(contour)
         center = (int(x), int(y))
@@ -306,123 +394,36 @@ def add_responder_markers(image, points):
 
 
 # ============================================================
-# OPENCV CAMERA: LINE + CRACK DETECTION
+# OPENCV CAMERA HEURISTICS
 # ============================================================
 
-def detect_lines_and_cracks(image):
-    """
-    OpenCV visual screening:
-    1. Canny detects edges.
-    2. HoughLinesP detects strong straight/structural lines.
-    3. Morphological processing highlights thin irregular crack-like structures.
-    4. Results are drawn on a dedicated overlay.
-
-    This is a visual screening method, not a validated structural-crack detector.
-    """
-
+def opencv_scene_analysis(image):
     output = image.copy()
-    line_overlay = image.copy()
 
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Improve contrast and suppress small camera noise.
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # ---------------- CANNY EDGES ----------------
-    edges = cv2.Canny(gray, 60, 150)
-
-    # Close small gaps so crack-like structures become continuous.
-    crack_kernel = np.ones((3, 3), np.uint8)
-    crack_edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        crack_kernel,
-        iterations=1,
-    )
-
-    # ---------------- HOUGH LINE DETECTION ----------------
-    min_line_length = max(30, int(min(h, w) * 0.08))
-
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=45,
-        minLineLength=min_line_length,
-        maxLineGap=12,
-    )
-
-    line_count = 0
-    line_lengths = []
-
-    if lines is not None:
-        for line in lines[:, 0]:
-            x1, y1, x2, y2 = map(int, line)
-
-            length = float(
-                np.hypot(x2 - x1, y2 - y1)
-            )
-
-            # Ignore tiny/noisy lines.
-            if length < min_line_length:
-                continue
-
-            cv2.line(
-                line_overlay,
-                (x1, y1),
-                (x2, y2),
-                (255, 0, 0),
-                2,
-                cv2.LINE_AA,
-            )
-
-            line_count += 1
-            line_lengths.append(length)
-
-    # ---------------- CRACK-LIKE DETECTION ----------------
-    # Thin edge structures are emphasized using a smaller kernel.
-    thin_edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_OPEN,
-        np.ones((2, 2), np.uint8),
+    # -------- crack-like thin structures --------
+    edges = cv2.Canny(gray, 80, 160)
+    edges = cv2.dilate(
+        edges, np.ones((3, 3), np.uint8), iterations=1
     )
 
     contours, _ = cv2.findContours(
-        thin_edges,
-        cv2.RETR_LIST,
-        cv2.CHAIN_APPROX_NONE,
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     crack_like = 0
-    crack_boxes = []
 
     for contour in contours:
         area = cv2.contourArea(contour)
         perimeter = cv2.arcLength(contour, False)
 
-        if perimeter <= 0:
-            continue
+        if area < 20 and perimeter > 80:
+            x, y, cw, ch = cv2.boundingRect(contour)
 
-        x, y, cw, ch = cv2.boundingRect(contour)
-
-        # Thin/elongated edge candidate.
-        aspect = max(cw, ch) / max(1, min(cw, ch))
-        density = perimeter / max(1.0, area)
-
-        is_candidate = (
-            perimeter > 90
-            and max(cw, ch) > 25
-            and aspect > 2.0
-            and density > 0.12
-        )
-
-        if is_candidate:
-            # Avoid treating huge image borders as cracks.
-            if cw < 0.55 * w and ch < 0.55 * h:
-                crack_like += 1
-                crack_boxes.append((x, y, cw, ch))
-
+            if cw > 10 and ch > 10:
                 cv2.rectangle(
                     output,
                     (x, y),
@@ -430,82 +431,30 @@ def detect_lines_and_cracks(image):
                     (0, 0, 255),
                     2,
                 )
+                crack_like += 1
 
-                cv2.putText(
-                    output,
-                    "CRACK-LIKE",
-                    (x, max(18, y - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-    # Blend detected structural lines into the main image.
-    output = cv2.addWeighted(
-        output,
-        0.78,
-        line_overlay,
-        0.55,
-        0,
-    )
-
-    # Make a clean black/white edge view for the UI.
-    edge_view = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-
-    # Highlight crack candidates in the edge view.
-    for x, y, cw, ch in crack_boxes:
-        cv2.rectangle(
-            edge_view,
-            (x, y),
-            (x + cw, y + ch),
-            (0, 0, 255),
-            2,
-        )
-
-    # ---------------- WATER-LIKE REGIONS ----------------
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
+    # -------- water-like regions --------
     lower_water = np.array([80, 40, 40])
     upper_water = np.array([135, 255, 255])
 
     water_mask = cv2.inRange(
-        hsv,
-        lower_water,
-        upper_water,
+        hsv, lower_water, upper_water
     )
 
     water_pixels = np.sum(water_mask > 0)
     water_percentage = water_pixels / (h * w) * 100
 
     water_contours, _ = cv2.findContours(
-        water_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
+        water_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
-
-    water_overlay = output.copy()
 
     for contour in water_contours:
         if cv2.contourArea(contour) > 500:
             cv2.drawContours(
-                water_overlay,
-                [contour],
-                -1,
-                (255, 0, 0),
-                3,
+                output, [contour], -1, (255, 0, 0), 3
             )
 
-    output = cv2.addWeighted(
-        output,
-        0.85,
-        water_overlay,
-        0.30,
-        0,
-    )
-
-    # ---------------- DARK OBSTRUCTION / DEBRIS INDICATOR ----------------
+    # -------- dark obstruction/debris indicator --------
     dark_mask = cv2.inRange(
         hsv,
         np.array([0, 0, 0]),
@@ -515,42 +464,11 @@ def detect_lines_and_cracks(image):
     dark_percentage = np.sum(dark_mask > 0) / (h * w) * 100
     debris_possible = dark_percentage > 15
 
-    # ---------------- SUMMARY BANNER ----------------
-    avg_line_length = (
-        float(np.mean(line_lengths))
-        if line_lengths
-        else 0.0
-    )
-
-    cv2.rectangle(
-        output,
-        (0, 0),
-        (w, 40),
-        (7, 17, 31),
-        -1,
-    )
-
-    cv2.putText(
-        output,
-        f"LINES: {line_count} | CRACK-LIKE: {crack_like}",
-        (14, 27),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
     return {
         "image": output,
-        "edge_view": edge_view,
-        "line_overlay": line_overlay,
         "crack_like": crack_like,
-        "line_count": line_count,
-        "avg_line_length": avg_line_length,
         "water_percentage": water_percentage,
         "debris_possible": debris_possible,
-        "edges": edges,
     }
 
 
@@ -589,7 +507,7 @@ def find_model_path():
 def classify_detection(name):
     """
     Maps model class names to project categories.
-    Supports both COCO classes and future custom disaster classes.
+    This supports both COCO classes and future custom disaster classes.
     """
 
     n = name.lower().replace("_", " ").replace("-", " ")
@@ -688,10 +606,6 @@ def run_yolo(image, model_path, conf):
     return plotted, detections, "OK"
 
 
-# ============================================================
-# COMBINE CAMERA RESULTS
-# ============================================================
-
 def combine_camera_results(
     image,
     yolo_image,
@@ -699,104 +613,50 @@ def combine_camera_results(
     detections,
 ):
     """
-    Combines:
-    - YOLO object boxes
-    - OpenCV Hough line detection
-    - OpenCV crack-like screening
-    - water/debris heuristics
-
-    Risk score is only a visual screening indicator.
+    Adds project-specific warning banners and a simple
+    risk score. This is a screening score, not a safety certification.
     """
 
-    # Start from YOLO result so its boxes remain visible.
     output = yolo_image.copy()
-
-    # Add Hough lines on top.
-    line_overlay = cv_result["line_overlay"]
-    output = cv2.addWeighted(
-        output,
-        0.78,
-        line_overlay,
-        0.38,
-        0,
-    )
-
-    # Draw crack-like regions clearly.
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 60, 150)
-
-    contours, _ = cv2.findContours(
-        edges,
-        cv2.RETR_LIST,
-        cv2.CHAIN_APPROX_NONE,
-    )
-
-    h, w = image.shape[:2]
-
-    for contour in contours:
-        perimeter = cv2.arcLength(contour, False)
-        x, y, cw, ch = cv2.boundingRect(contour)
-
-        if perimeter <= 90:
-            continue
-
-        aspect = max(cw, ch) / max(1, min(cw, ch))
-        if (
-            max(cw, ch) > 25
-            and aspect > 2.0
-            and cw < 0.55 * w
-            and ch < 0.55 * h
-        ):
-            cv2.rectangle(
-                output,
-                (x, y),
-                (x + cw, y + ch),
-                (0, 0, 255),
-                2,
-            )
 
     risk = 0
     reasons = []
 
+    # AI categories
     category_counts = {}
 
     for d in detections:
         cat = d["category"]
         category_counts[cat] = category_counts.get(cat, 0) + 1
 
-    # YOLO indicators
     if category_counts.get("Fire / Smoke", 0) > 0:
         risk += 40
-        reasons.append("fire/smoke detected by YOLO")
+        reasons.append("fire/smoke detected")
 
     if category_counts.get("Flood / Water", 0) > 0:
         risk += 35
-        reasons.append("water/flood indicator detected by YOLO")
+        reasons.append("water/flood indicator detected")
 
     if category_counts.get("Debris / Rubble", 0) > 0:
         risk += 30
-        reasons.append("debris/rubble detected by YOLO")
+        reasons.append("debris/rubble detected")
 
     if category_counts.get("Building Damage", 0) > 0:
         risk += 45
-        reasons.append("building-damage class detected by YOLO")
+        reasons.append("building-damage class detected")
 
     if category_counts.get("Structural Crack", 0) > 0:
         risk += 35
-        reasons.append("crack class detected by YOLO")
+        reasons.append("crack class detected")
 
-    # OpenCV indicators
+    # OpenCV visual screening
     if cv_result["water_percentage"] > 8:
         risk += 20
         reasons.append("water-like pixels detected")
 
     if cv_result["crack_like"] > 10:
         risk += 15
-        reasons.append("multiple crack-like edge structures")
-
-    if cv_result["line_count"] > 20:
-        risk += 5
-        reasons.append("multiple structural/edge lines detected")
+        reasons.append("many edge/crack-like structures")
 
     if cv_result["debris_possible"]:
         risk += 10
@@ -899,11 +759,6 @@ camera_conf = st.sidebar.slider(
     0.05,
 )
 
-st.sidebar.markdown(
-    "**Camera pipeline:**\n"
-    "Canny → Hough Lines → Crack-like screening → YOLO"
-)
-
 model_path, is_custom = find_model_path()
 
 if is_custom:
@@ -949,7 +804,7 @@ with sat2:
 if pre_file is not None and post_file is not None:
     if st.button(
         "🚨 ANALYZE DISASTER DAMAGE",
-        use_container_width=True,
+        width="stretch",
     ):
         with st.spinner("Running OpenCV satellite analysis..."):
             try:
@@ -1038,21 +893,21 @@ if st.session_state.satellite_result is not None:
         st.markdown("### BEFORE")
         st.image(
             cv_to_rgb(result["pre"]),
-            use_container_width=True,
+            width="stretch",
         )
 
     with b:
         st.markdown("### AFTER")
         st.image(
             cv_to_rgb(result["post"]),
-            use_container_width=True,
+            width="stretch",
         )
 
     with c:
         st.markdown("### DAMAGE MAP")
         st.image(
             cv_to_rgb(result["damage_map"]),
-            use_container_width=True,
+            width="stretch",
         )
 
     p = result["percentages"]
@@ -1112,8 +967,123 @@ if st.session_state.satellite_result is not None:
         buffer.getvalue(),
         "disaster_damage_map.png",
         "image/png",
-        use_container_width=True,
+        width="stretch",
     )
+
+
+# ============================================================
+# DRONE SCAN HISTORY UI
+# ============================================================
+
+st.markdown("---")
+st.markdown('<div class="section-title">🚁 Drone Change Detection & Scan History</div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="note">
+Prototype mode: upload one new drone image for each scan. The first scan is stored as the baseline. Every later scan is automatically compared with the previous saved scan, and the image, damage map and statistics are retained locally.
+</div>
+""", unsafe_allow_html=True)
+
+drone_file = st.file_uploader("📡 Upload simulated drone scan", type=["jpg", "jpeg", "png"], key="drone_scan_upload")
+
+d1, d2 = st.columns(2)
+with d1:
+    process_drone = st.button("🚁 REGISTER NEW DRONE SCAN", width="stretch")
+with d2:
+    if st.button("🔄 Refresh Scan History", width="stretch"):
+        st.session_state.drone_history = load_drone_history()
+        st.rerun()
+
+if st.session_state.drone_history is None:
+    st.session_state.drone_history = load_drone_history()
+
+if drone_file is not None and process_drone:
+    current_hash = drone_image_hash(drone_file)
+    if current_hash == st.session_state.drone_last_hash:
+        st.info("This drone image is already registered. Upload a new image for the next scan.")
+    else:
+        with st.spinner("Registering drone scan and running change detection..."):
+            try:
+                current_image = uploaded_to_cv(drone_file)
+                history = load_drone_history()
+                previous_record = history[-1] if history else None
+                analysis = analyze_drone_scan(current_image, previous_record, low_threshold, moderate_threshold, critical_threshold, minimum_area, responder_points, show_responders)
+                scan_number = len(history) + 1
+                scan_id = f"scan_{scan_number:03d}"
+                timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                image_path = DRONE_SCANS / f"{scan_id}.png"
+                map_path = DRONE_SCANS / f"{scan_id}_damage_map.png"
+                save_drone_image(analysis["current"], image_path)
+                save_drone_image(analysis["damage_map"], map_path)
+                stats = drone_damage_summary(analysis["percentages"])
+                previous_stats = previous_record.get("statistics", {}) if previous_record else {}
+                record = {
+                    "scan_id": scan_id,
+                    "timestamp": timestamp,
+                    "image_path": str(image_path),
+                    "damage_map_path": str(map_path),
+                    "compared_with": previous_record["scan_id"] if previous_record else None,
+                    "baseline": not bool(previous_record),
+                    "alignment_successful": bool(analysis["aligned"]),
+                    "feature_matches": int(analysis["matches"]),
+                    "statistics": stats,
+                    "previous_statistics": previous_stats,
+                    "image_hash": current_hash,
+                }
+                save_drone_record(record)
+                st.session_state.drone_last_hash = current_hash
+                st.session_state.drone_history = load_drone_history()
+                st.session_state.drone_current_analysis = {**analysis, "record": record}
+                if record["baseline"]:
+                    st.success(f"✅ {scan_id} saved. This scan is now the baseline.")
+                else:
+                    st.success(f"✅ {scan_id} saved and automatically compared with {record['compared_with']}.")
+            except Exception as e:
+                st.error(f"Drone scan failed: {e}")
+
+drone_history = st.session_state.drone_history or []
+if drone_history:
+    latest = drone_history[-1]
+    st.markdown("### 📡 Latest Drone Scan")
+    latest_analysis = st.session_state.drone_current_analysis
+    if latest_analysis is not None and latest_analysis.get("record", {}).get("scan_id") == latest.get("scan_id"):
+        analysis = latest_analysis
+        a, b, c = st.columns(3)
+        with a:
+            st.image(cv_to_rgb(analysis["previous"] if analysis["previous"] is not None else analysis["current"]), caption=f"Previous: {latest['compared_with']}" if latest["compared_with"] else "Baseline drone scan", width="stretch")
+        with b:
+            st.image(cv_to_rgb(analysis["current"]), caption=f"Current: {latest['scan_id']}", width="stretch")
+        with c:
+            st.image(cv_to_rgb(analysis["damage_map"]), caption="Automatic change / damage map", width="stretch")
+        if latest["baseline"]:
+            st.info("🟢 Baseline created. The next drone scan will be automatically compared with this saved scan.")
+        elif latest["alignment_successful"]:
+            st.success(f"✅ Compared with {latest['compared_with']} using ORB alignment ({latest['feature_matches']} good matches).")
+        else:
+            st.warning("⚠️ Reliable automatic alignment was not found; comparison continued after resizing.")
+        p = latest["statistics"]
+        st.markdown("#### 📊 Current Scan Damage Statistics")
+        stat_cols = st.columns(5)
+        stat_values = [("🟢 SAFE", p["Safe"]), ("🟡 LOW", p["Low Damage"]), ("🟠 MODERATE", p["Moderate Damage"]), ("🔴 CRITICAL", p["Critical"]), ("⚠️ AFFECTED", p["Affected Area"])]
+        for col, (label, value) in zip(stat_cols, stat_values):
+            with col:
+                st.markdown(f'<div class="metric"><div class="metric-title">{label}</div><div class="metric-value">{value:.1f}%</div></div>', unsafe_allow_html=True)
+        if not latest["baseline"] and latest.get("previous_statistics"):
+            prev = latest["previous_statistics"]
+            st.markdown("#### 📈 Change Since Previous Scan")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Affected Area", f"{p['Affected Area']:.1f}%", f"{p['Affected Area']-prev.get('Affected Area',0):+.1f} pp")
+            c2.metric("Critical", f"{p['Critical']:.1f}%", f"{p['Critical']-prev.get('Critical',0):+.1f} pp")
+            c3.metric("Moderate", f"{p['Moderate Damage']:.1f}%", f"{p['Moderate Damage']-prev.get('Moderate Damage',0):+.1f} pp")
+    st.markdown("### 🗂️ Drone Scan History")
+    rows=[]
+    for r in drone_history:
+        s=r["statistics"]
+        rows.append({"Scan":r["scan_id"],"Time":r["timestamp"],"Compared With":r["compared_with"] or "Baseline","Affected":f"{s['Affected Area']:.1f}%","Critical":f"{s['Critical']:.1f}%","Moderate":f"{s['Moderate Damage']:.1f}%","Low":f"{s['Low Damage']:.1f}%","Safe":f"{s['Safe']:.1f}%"})
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.download_button("⬇️ Download Drone Scan History", json.dumps(drone_history, indent=2), "drone_scan_history.json", "application/json", width="stretch")
+    st.markdown('<div class="note">Prototype note: scan files are stored in <code>drone_history/</code>. For permanent production history on cloud hosting, use a database or object storage.</div>', unsafe_allow_html=True)
+else:
+    st.info("No drone scans saved yet. Upload your first simulated drone image — it will automatically become the baseline.")
 
 
 # ============================================================
@@ -1130,8 +1100,9 @@ st.markdown(
     """
     <div class="note">
     Capture an affected-area photo. The system combines YOLO object
-    detection with OpenCV line detection, crack-like screening,
-    water analysis and obstruction screening.
+    detection with OpenCV visual screening. Generic pretrained YOLO
+    classes are useful for people and vehicles; disaster-specific
+    classes require a custom model.
     </div>
     """,
     unsafe_allow_html=True,
@@ -1145,13 +1116,13 @@ camera_image = st.camera_input(
 if camera_image is not None:
     if st.button(
         "🔍 ANALYZE CAMERA IMAGE",
-        use_container_width=True,
+        width="stretch",
     ):
-        with st.spinner("Running YOLO + OpenCV line/crack analysis..."):
+        with st.spinner("Running AI + OpenCV camera analysis..."):
             try:
                 camera_cv = uploaded_to_cv(camera_image)
 
-                cv_result = detect_lines_and_cracks(
+                cv_result = opencv_scene_analysis(
                     camera_cv
                 )
 
@@ -1198,13 +1169,13 @@ if st.session_state.camera_result is not None:
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns([1.35, 1])
+    left, right = st.columns([1.3, 1])
 
     with left:
         st.image(
             cv_to_rgb(cam["image"]),
-            caption="YOLO boxes + Hough lines + crack-like regions",
-            use_container_width=True,
+            caption="YOLO + OpenCV detection overlay",
+            width="stretch",
         )
 
     with right:
@@ -1229,51 +1200,23 @@ if st.session_state.camera_result is not None:
         else:
             st.success("No major visual indicators detected.")
 
-    # ---------------- OPENCV VISUAL ANALYSIS ----------------
-    cv_result = cam["opencv"]
+        cv_result = cam["opencv"]
 
-    st.markdown("### 🔬 OpenCV Line & Crack Analysis")
-
-    metric_cols = st.columns(4)
-
-    with metric_cols[0]:
         st.metric(
-            "Detected Lines",
-            cv_result["line_count"],
-        )
-
-    with metric_cols[1]:
-        st.metric(
-            "Crack-like Regions",
+            "Crack-like edge regions",
             cv_result["crack_like"],
         )
 
-    with metric_cols[2]:
         st.metric(
-            "Avg Line Length",
-            f"{cv_result['avg_line_length']:.0f}px",
-        )
-
-    with metric_cols[3]:
-        st.metric(
-            "Water-like Area",
+            "Water-like area",
             f"{cv_result['water_percentage']:.1f}%",
         )
 
-    line_col, edge_col = st.columns(2)
-
-    with line_col:
-        st.image(
-            cv_to_rgb(cv_result["line_overlay"]),
-            caption="Hough line detection",
-            use_container_width=True,
-        )
-
-    with edge_col:
-        st.image(
-            cv_to_rgb(cv_result["edge_view"]),
-            caption="Canny edges + crack-like regions",
-            use_container_width=True,
+        st.metric(
+            "Debris/obstruction indicator",
+            "Possible"
+            if cv_result["debris_possible"]
+            else "Not prominent",
         )
 
     st.markdown("### 🤖 AI Detections")
@@ -1290,7 +1233,7 @@ if st.session_state.camera_result is not None:
 
         st.dataframe(
             pd.DataFrame(rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -1300,10 +1243,9 @@ if st.session_state.camera_result is not None:
 
     st.markdown(
         """
-        ⚠️ **Prototype note:** line/crack detection is an OpenCV
-        visual screening method and can produce false positives from
-        edges, shadows, textures and image noise. YOLO disaster classes
-        such as fire, flood, debris, building damage and structural
-        cracks require a custom annotated model.
+        ⚠️ **Prototype note:** this is an emergency-screening
+        demonstration, not a structural-safety certification.
+        OpenCV color/edge heuristics can produce false positives.
+        Disaster-specific YOLO classes require a custom annotated dataset.
         """,
     )
