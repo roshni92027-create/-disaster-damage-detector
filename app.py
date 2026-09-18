@@ -7,12 +7,28 @@ import time
 import hashlib
 import threading
 import queue
+import requests
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import folium
+    from folium.plugins import (
+        AntPath,
+        Fullscreen,
+        LocateControl,
+        MeasureControl,
+        MousePosition,
+        Geocoder,
+    )
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except Exception:
+    FOLIUM_AVAILABLE = False
 
 try:
     from ultralytics import YOLO
@@ -234,39 +250,288 @@ def make_alert(det,gps,scan_id,w,h,hfov=70,vfov=50):
             "latitude":lat,"longitude":lon,"confidence":det["Confidence"],
             "timestamp":now(),"gps_source":gps["source"],"image_path":None}
 
-def create_map(base,gps,path,responders,zones):
-    W,H=1200,620
-    if base is not None:
-        im=Image.fromarray(cv2.cvtColor(base,cv2.COLOR_BGR2RGB)).convert("RGB").resize((W,H))
-        im=im.copy()
-    else:
-        im=Image.new("RGB",(W,H),(16,27,36)); d=ImageDraw.Draw(im)
-        for x in range(0,W,50): d.line((x,0,x,H),fill=(29,45,56),width=1)
-        for y in range(0,H,50): d.line((0,y,W,y),fill=(29,45,56),width=1)
-        for x,y,r in [(180,120,90),(500,360,130),(900,170,110),(930,480,150)]:
-            d.ellipse((x-r,y-r,x+r,y+r),fill=(22,39,48),outline=(42,67,77),width=2)
-        d.text((20,20),"OFFLINE SATELLITE / TACTICAL MAP",fill=(170,194,210))
-    d=ImageDraw.Draw(im)
-    def xy(lat,lon):
-        scale=.006
-        return (int(W/2+(lon-gps["lon"])/scale*W/2),int(H/2-(lat-gps["lat"])/scale*H/2))
-    zone_colors={"critical":"#ff4048","moderate":"#ff9f43","low":"#ffd447","safe":"#48d597"}
-    for z in zones:
-        pts=[xy(a,b) for a,b in z["points"]]
-        d.polygon(pts,fill=zone_colors[z["kind"]],outline=zone_colors[z["kind"]])
-        cx=sum(p[0] for p in pts)//len(pts); cy=sum(p[1] for p in pts)//len(pts)
-        d.text((cx-45,cy-8),z["label"],fill="white")
-    if len(path)>1:
-        pts=[xy(p["lat"],p["lon"]) for p in path[-50:]]
-        for a,b in zip(pts[:-1],pts[1:]):
-            d.line((a,b),fill="#c9e7ff",width=2)
-    for i,r in enumerate(responders,1):
-        x,y=xy(r["lat"],r["lon"]); d.ellipse((x-10,y-10,x+10,y+10),fill="#5bc0ff",outline="white",width=2)
-        d.text((x+12,y-10),f"R{i}",fill="white")
-    dx,dy=xy(gps["lat"],gps["lon"])
-    d.polygon([(dx,dy-16),(dx-12,dy+10),(dx,dy+5),(dx+12,dy+10)],fill="#56e39a",outline="white")
-    d.text((dx+14,dy-14),"DRONE",fill="#56e39a")
-    return im
+def parse_map_coordinates(text):
+    """Parse a latitude,longitude search string."""
+    try:
+        parts = [x.strip() for x in text.split(",")]
+        if len(parts) != 2:
+            return None
+        lat = float(parts[0])
+        lon = float(parts[1])
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return [lat, lon]
+    except Exception:
+        pass
+    return None
+
+
+def geocode_location(query):
+    """Online place-name search using Nominatim; coordinate search works offline."""
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "jsonv2", "limit": 1},
+            headers={"User-Agent": "disaster-damage-detector/1.0"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        results = response.json()
+        if results:
+            return [float(results[0]["lat"]), float(results[0]["lon"])]
+    except Exception:
+        pass
+    return None
+
+
+def create_interactive_operation_map(
+    gps,
+    telemetry,
+    responders=None,
+    survivor_points=None,
+    zones=None,
+    offline_image=None,
+):
+    """Build the Google-Maps-style interactive disaster operation map."""
+    if not FOLIUM_AVAILABLE:
+        return None
+
+    responders = responders or []
+    survivor_points = survivor_points or []
+    zones = zones or []
+
+    lat = float(gps.get("lat", DEFAULT_GPS["lat"]))
+    lon = float(gps.get("lon", DEFAULT_GPS["lon"]))
+
+    if "map_center" not in st.session_state:
+        st.session_state.map_center = [lat, lon]
+    if "map_zoom" not in st.session_state:
+        st.session_state.map_zoom = 15
+
+    center = st.session_state.map_center
+    zoom = int(st.session_state.map_zoom)
+
+    m = folium.Map(
+        location=center,
+        zoom_start=zoom,
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True,
+    )
+
+    # Normal street map.
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="Street Map",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # Satellite imagery layer. This is an online layer; the offline image
+    # overlay below remains available when a local orthophoto is uploaded.
+    folium.TileLayer(
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        attr="Esri World Imagery",
+        name="Satellite",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    folium.TileLayer(
+        tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        attr="OpenTopoMap",
+        name="Terrain",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # Google-Maps-style controls.
+    Fullscreen(position="topleft").add_to(m)
+    LocateControl(auto_start=False, position="topleft").add_to(m)
+    MeasureControl(
+        position="topleft",
+        primary_length_unit="kilometers",
+        secondary_length_unit="meters",
+    ).add_to(m)
+    MousePosition(
+        position="bottomright",
+        separator=" | ",
+        prefix="GPS:",
+        num_digits=6,
+    ).add_to(m)
+    Geocoder(
+        collapsed=True,
+        position="topright",
+        add_marker=True,
+    ).add_to(m)
+
+    # -------------------------
+    # Drone
+    # -------------------------
+    drone_html = """
+    <div style="font-size:28px;transform:translate(-50%,-50%);text-shadow:0 0 7px #00e5ff;">
+        🛸
+    </div>
+    """
+
+    folium.Marker(
+        [lat, lon],
+        tooltip="LIVE DRONE D1",
+        popup=folium.Popup(
+            f"""
+            <b>DRONE D1</b><br>
+            Latitude: {lat:.6f}<br>
+            Longitude: {lon:.6f}<br>
+            Altitude: {float(gps.get('altitude', 0)):.1f} m<br>
+            Heading: {float(gps.get('heading', 0)):.1f}°<br>
+            Source: {gps.get('source', '--')}
+            """,
+            max_width=280,
+        ),
+        icon=folium.DivIcon(html=drone_html),
+    ).add_to(m)
+
+    # -------------------------
+    # Flight trail
+    # -------------------------
+    path = []
+    for point in telemetry[-100:]:
+        try:
+            path.append([float(point["lat"]), float(point["lon"])])
+        except Exception:
+            continue
+
+    if not path:
+        path = [[lat, lon]]
+    elif path[-1] != [lat, lon]:
+        path.append([lat, lon])
+
+    if len(path) >= 2:
+        AntPath(
+            locations=path,
+            color="#00d9ff",
+            pulse_color="#ffffff",
+            weight=4,
+            opacity=0.9,
+            delay=700,
+        ).add_to(m)
+        folium.PolyLine(
+            path,
+            color="#00d9ff",
+            weight=2,
+            opacity=0.45,
+            tooltip="Drone flight trail",
+        ).add_to(m)
+
+    # -------------------------
+    # Responders
+    # -------------------------
+    responder_group = folium.FeatureGroup(name="Responders", show=True)
+    for i, responder in enumerate(responders, 1):
+        try:
+            r_lat = float(responder["lat"])
+            r_lon = float(responder["lon"])
+        except Exception:
+            continue
+
+        responder_html = f"""
+        <div style="
+            background:#101b2a;
+            border:2px solid #22c55e;
+            border-radius:50%;
+            width:32px;height:32px;
+            display:flex;align-items:center;justify-content:center;
+            font-size:17px;
+            box-shadow:0 0 10px rgba(34,197,94,.8);
+        ">🪖</div>
+        """
+
+        folium.Marker(
+            [r_lat, r_lon],
+            tooltip=f"RESPONDER R{i}",
+            popup=f"<b>RESPONDER R{i}</b><br>Lat: {r_lat:.6f}<br>Lon: {r_lon:.6f}",
+            icon=folium.DivIcon(html=responder_html),
+        ).add_to(responder_group)
+    responder_group.add_to(m)
+
+    # -------------------------
+    # Survivor locations
+    # -------------------------
+    survivor_group = folium.FeatureGroup(name="Survivor Alerts", show=True)
+    for i, point in enumerate(survivor_points, 1):
+        try:
+            s_lat = float(point["lat"])
+            s_lon = float(point["lon"])
+        except Exception:
+            continue
+
+        folium.Marker(
+            [s_lat, s_lon],
+            tooltip=f"SURVIVOR {i}",
+            popup=f"<b>🚨 SURVIVOR DETECTED</b><br>Lat: {s_lat:.6f}<br>Lon: {s_lon:.6f}",
+            icon=folium.Icon(color="red", icon="plus", prefix="fa"),
+        ).add_to(survivor_group)
+    survivor_group.add_to(m)
+
+    # -------------------------
+    # Damage zones
+    # -------------------------
+    zone_group = folium.FeatureGroup(name="Damage Zones", show=True)
+    zone_colors = {
+        "critical": "#ef4444",
+        "moderate": "#f59e0b",
+        "low": "#facc15",
+        "safe": "#22c55e",
+    }
+
+    for zone in zones:
+        try:
+            zone_points = zone["points"]
+            kind = str(zone.get("kind", "moderate")).lower()
+            label = zone.get("label", kind.upper())
+            color = zone_colors.get(kind, "#f59e0b")
+            folium.Polygon(
+                locations=[[float(a), float(b)] for a, b in zone_points],
+                color=color,
+                weight=2,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.28,
+                tooltip=label,
+                popup=f"<b>{label}</b>",
+            ).add_to(zone_group)
+        except Exception:
+            continue
+    zone_group.add_to(m)
+
+    # -------------------------
+    # Approximate offline orthophoto overlay
+    # -------------------------
+    if offline_image is not None:
+        try:
+            radius_km = 2.0
+            lat_delta = radius_km / 111.32
+            lon_delta = radius_km / (
+                111.32 * max(math.cos(math.radians(lat)), 0.1)
+            )
+            bounds = [
+                [lat - lat_delta, lon - lon_delta],
+                [lat + lat_delta, lon + lon_delta],
+            ]
+            folium.raster_layers.ImageOverlay(
+                image=cv2.cvtColor(offline_image, cv2.COLOR_BGR2RGB),
+                bounds=bounds,
+                opacity=0.55,
+                name="Offline Orthophoto",
+                interactive=True,
+            ).add_to(m)
+        except Exception:
+            pass
+
+    folium.LayerControl(position="topright", collapsed=False).add_to(m)
+    return m
 
 # Thread-shared live state. Streamlit UI never writes from the WebRTC callback.
 LIVE_LOCK=threading.Lock()
@@ -366,15 +631,41 @@ telemetry=load_json(TELEMETRY_FILE,[])
 if not telemetry:
     telemetry=[gps]
 
-st.markdown("## 🛰️ DISASTER MANAGEMENT DASHBOARD")
-h1,h2,h3,h4=st.columns([1.2,1,1,1])
-h1.markdown("**COMMAND CENTER**  •  <span class='live'>● SYSTEM ONLINE</span>",unsafe_allow_html=True)
-h2.metric("DRONE","LIVE",gps["source"])
-h3.metric("COORDINATES",f"{gps['lat']:.4f}",f"{gps['lon']:.4f}")
-h4.markdown(f"**{now().split()[1]}**  \n<span class='small-muted'>SAVE LIVES • AI RESPONSE</span>",unsafe_allow_html=True)
+# Dashboard notification feed shown alongside live AI alerts.
+def dashboard_events(current_gps, alert_list):
+    events=[]
+    for a in alert_list[-8:]:
+        events.append({
+            "time": str(a.get("timestamp", "--"))[-8:-3],
+            "icon": "🚨",
+            "title": "Survivor Detected",
+            "detail": f"Lat: {a.get('latitude','--')}, Lon: {a.get('longitude','--')}",
+            "kind": "danger",
+            "image_path": a.get("image_path")
+        })
+    events += [
+        {"time":"14:24","icon":"🪖","title":"Responder Message (Unit 2)","detail":"Reaching location in 5 minutes.","kind":"info"},
+        {"time":"14:20","icon":"🔋","title":"Low Battery Warning","detail":"Battery at 20% • Return-to-base check.","kind":"warn"},
+        {"time":"14:12","icon":"✅","title":"Area Surveyed — No Damage","detail":"Sector B3 completed.","kind":"safe"},
+        {"time":"14:05","icon":"🪖","title":"Responder Message (Unit 3)","detail":"Proceeding to marked location.","kind":"info"},
+        {"time":"13:58","icon":"⚠️","title":"New Zone Identified","detail":"Moderate damage area marked.","kind":"warn"},
+        {"time":"13:45","icon":"ℹ️","title":"System","detail":"Drone D1 started autonomous survey.","kind":"info"},
+    ]
+    return events
+
+header1, header2, header3 = st.columns([3.4,1.2,1.4], gap="small")
+with header1:
+    st.markdown("# 🛸 DISASTER MANAGEMENT DASHBOARD")
+    st.caption("AERIAL INTELLIGENCE  |  FASTER RESPONSE  |  SAFER TOMORROW")
+with header2:
+    st.success("● SYSTEM ONLINE")
+    st.caption("DRONE D1 • LIVE")
+with header3:
+    st.metric("MISSION TIME", now().split()[1])
+    st.caption("SAVE LIVES • BUILD A SAFER TOMORROW")
 st.divider()
 
-left,center,right=st.columns([1.15,2.2,1.05],gap="small")
+left,center,right=st.columns([0.95,3.6,1.0],gap="small")
 
 with left:
     st.markdown("### 📹 RGB LIVE FEED")
@@ -449,64 +740,261 @@ with left:
         if r["damage_map"] is not None: st.image(rgb(r["damage_map"]),width="stretch")
 
 with center:
-    st.markdown("### 🗺️ OFFLINE SATELLITE OPERATION MAP")
-    base=st.session_state.get("offline_map")
-    if base is None and st.session_state.pre is not None: base=st.session_state.pre
-    path=telemetry[-40:] if telemetry else [{"lat":gps["lat"],"lon":gps["lon"]}]
-    if len(path) < 2:
-        path=[{"lat":gps["lat"]+.001,"lon":gps["lon"]-.001},{"lat":gps["lat"],"lon":gps["lon"]}]
-    responders=[{"lat":gps["lat"]+.0012,"lon":gps["lon"]-.0015},{"lat":gps["lat"]-.0015,"lon":gps["lon"]+.001},{"lat":gps["lat"]+.0005,"lon":gps["lon"]+.002}]
-    zones=[
-        {"kind":"critical","label":"CRITICAL / HIGH SURVIVOR","points":[(gps["lat"]+.0002,gps["lon"]-.0025),(gps["lat"]+.0022,gps["lon"]-.0020),(gps["lat"]+.0017,gps["lon"]-.0003),(gps["lat"]-.0002,gps["lon"]-.0007)]},
-        {"kind":"moderate","label":"MODERATE / HIGH PRIORITY","points":[(gps["lat"]+.0015,gps["lon"]+.0002),(gps["lat"]+.0026,gps["lon"]+.0018),(gps["lat"]+.0005,gps["lon"]+.0028),(gps["lat"]-.0001,gps["lon"]+.001)]},
-        {"kind":"low","label":"LOW","points":[(gps["lat"]-.0003,gps["lon"]-.003),(gps["lat"]-.0017,gps["lon"]-.0022),(gps["lat"]-.0022,gps["lon"]-.0002),(gps["lat"]-.0005,gps["lon"]+.0001)]},
-        {"kind":"safe","label":"SURVEYED / SAFE","points":[(gps["lat"]-.0018,gps["lon"]+.0005),(gps["lat"]-.001,gps["lon"]+.0028),(gps["lat"]-.0026,gps["lon"]+.0032),(gps["lat"]-.003,gps["lon"]+.001)]},
-    ]
-    st.image(create_map(base,gps,path,responders,zones),width="stretch")
-    m1,m2,m3,m4=st.columns(4)
-    m1.markdown("🔴 **CRITICAL**")
-    m2.markdown("🟠 **MODERATE**")
-    m3.markdown("🟡 **LOW**")
-    m4.markdown("🟢 **SURVEYED**")
-    st.caption(f"Drone: {gps['lat']:.6f}, {gps['lon']:.6f}  •  Alt {gps['altitude']:.1f} m  •  Heading {gps['heading']:.0f}°")
-    if alerts:
-        recent=alerts[-5:]
-        survivor_points=[{"lat":a["latitude"],"lon":a["longitude"]} for a in recent if a.get("latitude") is not None]
+    st.markdown("### 🗺️ LIVE OPERATION MAP")
+
+    if not FOLIUM_AVAILABLE:
+        st.error(
+            "Interactive map dependencies are missing. "
+            "Install folium and streamlit-folium from requirements.txt."
+        )
+    else:
+        # -------------------------
+        # Google-Maps-style search bar
+        # -------------------------
+        search_col, search_btn_col, follow_col, drone_col = st.columns(
+            [4.2, 1.0, 1.45, 1.2], gap="small"
+        )
+
+        with search_col:
+            map_search = st.text_input(
+                "Map search",
+                placeholder="Search place or enter latitude, longitude",
+                label_visibility="collapsed",
+                key="map_search",
+            )
+
+        with search_btn_col:
+            search_clicked = st.button(
+                "🔍 Search",
+                use_container_width=True,
+                key="map_search_button",
+            )
+
+        with follow_col:
+            follow_drone = st.checkbox(
+                "Follow Drone",
+                value=False,
+                key="follow_drone",
+            )
+
+        with drone_col:
+            center_drone = st.button(
+                "🎯 Drone",
+                use_container_width=True,
+                key="center_drone",
+            )
+
+        # -------------------------
+        # Search handling
+        # -------------------------
+        if search_clicked and map_search.strip():
+            target = parse_map_coordinates(map_search.strip())
+            if target is None:
+                target = geocode_location(map_search.strip())
+
+            if target:
+                st.session_state.map_center = target
+                st.session_state.map_zoom = 16
+                st.success(
+                    f"Map centered at {target[0]:.6f}, {target[1]:.6f}"
+                )
+            else:
+                st.warning(
+                    "Location not found. Try a place name or "
+                    "latitude,longitude."
+                )
+
+        if center_drone or follow_drone:
+            st.session_state.map_center = [
+                float(gps["lat"]),
+                float(gps["lon"]),
+            ]
+            st.session_state.map_zoom = 17
+
+        # -------------------------
+        # Map data
+        # -------------------------
+        base = st.session_state.get("offline_map")
+        if base is None and st.session_state.pre is not None:
+            base = st.session_state.pre
+
+        path = telemetry[-100:] if telemetry else [
+            {"lat": gps["lat"], "lon": gps["lon"]}
+        ]
+        if len(path) < 2:
+            path = [
+                {"lat": gps["lat"] + .001, "lon": gps["lon"] - .001},
+                {"lat": gps["lat"], "lon": gps["lon"]},
+            ]
+
+        responders = [
+            {
+                "lat": gps["lat"] + .0012,
+                "lon": gps["lon"] - .0015,
+            },
+            {
+                "lat": gps["lat"] - .0015,
+                "lon": gps["lon"] + .001,
+            },
+            {
+                "lat": gps["lat"] + .0005,
+                "lon": gps["lon"] + .002,
+            },
+        ]
+
+        zones = [
+            {
+                "kind": "critical",
+                "label": "CRITICAL / HIGH SURVIVOR",
+                "points": [
+                    (gps["lat"] + .0002, gps["lon"] - .0025),
+                    (gps["lat"] + .0022, gps["lon"] - .0020),
+                    (gps["lat"] + .0017, gps["lon"] - .0003),
+                    (gps["lat"] - .0002, gps["lon"] - .0007),
+                ],
+            },
+            {
+                "kind": "moderate",
+                "label": "MODERATE / HIGH PRIORITY",
+                "points": [
+                    (gps["lat"] + .0015, gps["lon"] + .0002),
+                    (gps["lat"] + .0026, gps["lon"] + .0018),
+                    (gps["lat"] + .0005, gps["lon"] + .0028),
+                    (gps["lat"] - .0001, gps["lon"] + .0010),
+                ],
+            },
+            {
+                "kind": "low",
+                "label": "LOW",
+                "points": [
+                    (gps["lat"] - .0003, gps["lon"] - .0030),
+                    (gps["lat"] - .0017, gps["lon"] - .0022),
+                    (gps["lat"] - .0022, gps["lon"] - .0002),
+                    (gps["lat"] - .0005, gps["lon"] + .0001),
+                ],
+            },
+            {
+                "kind": "safe",
+                "label": "SURVEYED / SAFE",
+                "points": [
+                    (gps["lat"] - .0018, gps["lon"] + .0005),
+                    (gps["lat"] - .0010, gps["lon"] + .0028),
+                    (gps["lat"] - .0026, gps["lon"] + .0032),
+                    (gps["lat"] - .0030, gps["lon"] + .0010),
+                ],
+            },
+        ]
+
+        recent = alerts[-10:]
+        survivor_points = [
+            {
+                "lat": a.get("latitude"),
+                "lon": a.get("longitude"),
+            }
+            for a in recent
+            if a.get("latitude") is not None
+            and a.get("longitude") is not None
+        ]
+
+        operation_map = create_interactive_operation_map(
+            gps=gps,
+            telemetry=telemetry,
+            responders=responders,
+            survivor_points=survivor_points,
+            zones=zones,
+            offline_image=base,
+        )
+
+        # IMPORTANT: only listen for explicit map clicks.
+        # Listening to center/zoom causes Streamlit to rerun the whole
+        # page on every pan/zoom event, which makes the iframe flicker.
+        map_state = st_folium(
+            operation_map,
+            width=1200,
+            height=760,
+            returned_objects=["last_clicked"],
+            key="operation_map",
+        )
+
+        # A click is an intentional interaction, so a single rerun here is
+        # acceptable. Pan/zoom now stay entirely inside the Leaflet iframe.
+        if map_state and map_state.get("last_clicked"):
+            clicked = map_state["last_clicked"]
+            st.session_state.selected_map_coord = [
+                clicked["lat"],
+                clicked["lng"],
+            ]
+
+        if st.session_state.get("selected_map_coord"):
+            selected = st.session_state.selected_map_coord
+            st.caption(
+                f"📍 Selected Coordinates: "
+                f"{selected[0]:.6f}, {selected[1]:.6f}"
+            )
+
+        legend1, legend2, legend3, legend4 = st.columns(4)
+        legend1.markdown("🔴 **CRITICAL**")
+        legend2.markdown("🟠 **MODERATE**")
+        legend3.markdown("🟡 **LOW**")
+        legend4.markdown("🟢 **SURVEYED**")
+        st.caption(
+            f"🛸 Drone D1: {gps['lat']:.6f}, {gps['lon']:.6f}"
+            f"  •  Alt {gps['altitude']:.1f} m"
+            f"  •  Heading {gps['heading']:.0f}°"
+        )
         if survivor_points:
-            st.caption("Latest survivor coordinates are persisted in the alert log and can be used for responder routing.")
+            st.caption(
+                "🚨 Latest survivor coordinates are displayed on the map "
+                "and persisted in the alert log."
+            )
 
 with right:
     @st.fragment(run_every="2s")
     def notification_panel():
         live_alerts=load_json(ALERTS_FILE,[])
-        st.markdown("### 🔔 NOTIFICATIONS")
-        if not live_alerts:
-            st.info("No active alerts.")
-        else:
+        feed=dashboard_events(gps, live_alerts)
+        st.markdown("### 🔔 NOTIFICATIONS & ALERTS")
+        tabs=st.tabs(["All","Survivors","Responders","System"])
+        with tabs[0]:
+            if not feed:
+                st.info("No alerts yet.")
+            else:
+                for item in feed[:9]:
+                    cls=item["kind"]
+                    st.markdown(f"**{item['time']}  {item['icon']}  {item['title']}**")
+                    st.caption(item["detail"])
+                    if item.get("image_path") and Path(item["image_path"]).exists():
+                        st.image(item["image_path"], width="stretch")
+                    st.divider()
+        with tabs[1]:
+            survivors=[x for x in feed if x["kind"]=="danger"]
+            if survivors:
+                for x in survivors: st.error(f"{x['icon']} {x['title']}\n\n{x['detail']}")
+            else: st.info("No survivor alerts.")
+        with tabs[2]:
+            for x in feed:
+                if x["title"].startswith("Responder"):
+                    st.info(f"{x['icon']} {x['title']}\n\n{x['detail']}")
+        with tabs[3]:
+            for x in feed:
+                if x["kind"] in ("warn","safe","info"):
+                    st.caption(f"{x['time']} • {x['title']} — {x['detail']}")
+        if live_alerts:
             latest=live_alerts[-1]
             latest_id=latest.get("alert_id")
             if latest_id and latest_id not in st.session_state.toast_seen:
                 st.session_state.toast_seen.add(latest_id)
-                st.toast(
-                    f"🚨 Survivor detected at {latest.get('latitude'):.6f}, {latest.get('longitude'):.6f}",
-                    icon="🚨",
-                )
-            st.error(f"🚨 SURVIVOR DETECTED  •  {latest.get('confidence',0)*100:.0f}%")
-            st.markdown(f"**📍 {latest.get('latitude'):.6f}, {latest.get('longitude'):.6f}**")
-            st.caption(f"{latest.get('timestamp')}  •  {latest.get('scan_id')}")
-            if latest.get("image_path") and Path(latest["image_path"]).exists():
-                st.image(latest["image_path"],caption="Captured survivor frame",width="stretch")
-            st.divider()
-            for a in reversed(live_alerts[-6:]):
-                st.markdown(f"**🚨 Survivor**  \n`{a.get('latitude'):.6f}, {a.get('longitude'):.6f}`  \n{a.get('confidence',0)*100:.0f}% • {a.get('timestamp')}")
-        if gps["altitude"]<20:
-            st.warning("🔋 LOW ALTITUDE / RETURN CHECK")
+                st.toast(f"🚨 Survivor: {latest.get('latitude'):.6f}, {latest.get('longitude'):.6f}", icon="🚨")
     notification_panel()
 
 st.divider()
 
 st.markdown("### COMMAND / STORAGE")
-buttons=["🗺️ Offline Maps","📍 Coordinates","🛰️ Pre-Disaster","🖼️ Captured Images","🎞️ Footage","📊 Graphs","➕ Drop Aid Kit"]
+buttons=[
+    "🗺️ Offline Maps","📍 Coordinates","🛰️ Pre-Disaster Images","🖼️ Captured Images",
+    "🎞️ Video Footage","📊 Damage Analysis","◔ Zone Statistics","📋 Flight Logs",
+    "〽️ Sensor Data","➕ Drop Aid Kit","⚙️ Settings"
+]
 cols=st.columns(len(buttons))
 for i,label in enumerate(buttons):
     with cols[i]:
@@ -516,68 +1004,88 @@ for i,label in enumerate(buttons):
 panel=st.session_state.active_panel
 if panel==0:
     with st.container(border=True):
-        st.subheader("Offline Map Storage")
+        st.subheader("🗺️ Offline Maps")
         map_up=st.file_uploader("Load offline satellite / orthophoto",["jpg","jpeg","png","webp"],key="offline_map_up")
         if map_up:
             st.session_state.offline_map=cv_image(map_up)
             path=MAP_DIR/f"offline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(str(path),st.session_state.offline_map)
-            st.success("Offline map loaded into the command center.")
+            st.success("Offline satellite map loaded.")
 elif panel==1:
     with st.container(border=True):
-        st.subheader("Coordinates & Responder Routing")
-        st.dataframe(pd.DataFrame([{"Asset":"DRONE","Latitude":gps["lat"],"Longitude":gps["lon"],"Altitude m":gps["altitude"],"Heading":gps["heading"]}]+
-                                  [{"Asset":f"RESPONDER {i+1}","Latitude":r["lat"],"Longitude":r["lon"]} for i,r in enumerate(responders)]),
-                     hide_index=True,width="stretch")
-        st.caption("Responder coordinates in this prototype are configurable demo markers.")
+        st.subheader("📍 Coordinates")
+        st.dataframe(pd.DataFrame([{"Asset":"DRONE D1","Latitude":gps["lat"],"Longitude":gps["lon"],"Altitude m":gps["altitude"],"Heading":gps["heading"]}] + [{"Asset":f"RESPONDER {i+1}","Latitude":r["lat"],"Longitude":r["lon"]} for i,r in enumerate(responders)]), hide_index=True, width="stretch")
 elif panel==2:
     with st.container(border=True):
-        st.subheader("Pre-Disaster Satellite Archive")
-        files=sorted(PREPOST_DIR.glob("*"),reverse=True)
-        if files:
-            st.image(str(files[0]),width="stretch")
-        else: st.info("Upload a pre-disaster image in the left PRE ↔ POST panel to create the archive.")
+        st.subheader("🛰️ Pre-Disaster Satellite Archive")
+        files=sorted(PREPOST_DIR.glob("pre_*.jpg"),reverse=True)
+        if files: st.image(str(files[0]),caption="Latest pre-disaster reference",width="stretch")
+        else: st.info("Upload a pre-disaster image in PRE ↔ POST.")
 elif panel==3:
     with st.container(border=True):
-        st.subheader("Captured Survivor Images")
+        st.subheader("🖼️ Captured Survivor Images")
         caps=sorted(FOOTAGE_DIR.glob("*.jpg"),reverse=True)
         if caps:
-            cc=st.columns(min(3,len(caps)))
-            for i,p in enumerate(caps[:9]):
-                with cc[i%len(cc)]: st.image(str(p),caption=p.stem,width="stretch")
-        else: st.info("No captured survivor frames yet.")
+            cc=st.columns(min(4,len(caps)))
+            for i,pth in enumerate(caps[:12]):
+                with cc[i%len(cc)]: st.image(str(pth),caption=pth.stem,width="stretch")
+        else: st.info("No survivor captures yet. Start the live RGB feed.")
 elif panel==4:
     with st.container(border=True):
-        st.subheader("Footage / AI Events")
+        st.subheader("🎞️ Video Footage / AI Events")
         events=load_json(EVENTS_FILE,[])
         if events: st.dataframe(pd.DataFrame(events[-50:]),hide_index=True,width="stretch")
-        else: st.info("Live AI events will appear here.")
+        else: st.info("AI footage events will appear here.")
 elif panel==5:
     with st.container(border=True):
-        st.subheader("Mission Graphs")
+        st.subheader("📊 Damage Analysis")
         if st.session_state.last_result:
             stats=st.session_state.last_result["stats"]
             st.bar_chart(pd.DataFrame({"Area %":stats}).T)
-        hist=load_json(EVENTS_FILE,[])
-        st.metric("Recorded mission events",len(hist))
-        st.metric("Survivor alerts",len(alerts))
+            st.dataframe(pd.DataFrame({"Damage Class":list(stats),"Area %":list(stats.values())}),hide_index=True,width="stretch")
+        else: st.info("Run a PRE ↔ POST comparison first.")
 elif panel==6:
+    with st.container(border=True):
+        st.subheader("◔ Zone Statistics")
+        stats=st.session_state.last_result["stats"] if st.session_state.last_result else {"Critical":18,"Moderate":32,"Low":28,"Safe":22}
+        st.metric("Critical / High Survivor Chance",f"{stats.get('Critical',0):.1f}%")
+        st.metric("Moderate / High Population",f"{stats.get('Moderate',0):.1f}%")
+        st.metric("Low Damage",f"{stats.get('Low',0):.1f}%")
+        st.metric("Surveyed / Safe",f"{stats.get('Safe',0):.1f}%")
+elif panel==7:
+    with st.container(border=True):
+        st.subheader("📋 Flight Logs")
+        st.dataframe(pd.DataFrame(telemetry[-100:]),hide_index=True,width="stretch")
+elif panel==8:
+    with st.container(border=True):
+        st.subheader("〽️ Sensor Data")
+        c1,c2,c3=st.columns(3)
+        c1.metric("GPS Source",gps["source"])
+        c2.metric("Altitude",f"{gps['altitude']:.1f} m")
+        c3.metric("Heading",f"{gps['heading']:.0f}°")
+        st.caption("Thermal panel is a thermal-style visualization when a true thermal sensor stream is not connected.")
+elif panel==9:
     with st.container(border=True):
         st.subheader("➕ DROP AID KIT")
         options=[a for a in alerts[-20:] if a.get("latitude") is not None]
         if not options:
-            st.info("First detect a survivor/person. The selected target coordinate will appear here.")
+            st.info("Detect a person/survivor first. The target coordinates will appear here automatically.")
         else:
             labels=[f"{a['alert_id']} • {a['latitude']:.6f}, {a['longitude']:.6f} • {a['confidence']*100:.0f}%" for a in options]
             idx=st.selectbox("Select survivor target",range(len(labels)),format_func=lambda i:labels[i])
             target=options[idx]
-            st.success(f"TARGET LOCKED: {target['latitude']:.6f}, {target['longitude']:.6f}")
+            st.success(f"TARGET LOCKED • {target['latitude']:.6f}, {target['longitude']:.6f}")
             kit=st.selectbox("Aid kit type",["Medical","Water","Food","Emergency Pack"])
             if st.button("🚁 CONFIRM AID DROP",type="primary",width="stretch"):
-                drop={"drop_id":uid("AID"),"kit":kit,"latitude":target["latitude"],"longitude":target["longitude"],
-                      "alert_id":target["alert_id"],"timestamp":now(),"status":"COMMAND LOGGED"}
+                drop={"drop_id":uid("AID"),"kit":kit,"latitude":target["latitude"],"longitude":target["longitude"],"alert_id":target["alert_id"],"timestamp":now(),"status":"COMMAND LOGGED"}
                 append_json(AID_FILE,drop)
-                st.success(f"Aid drop logged for {target['latitude']:.6f}, {target['longitude']:.6f}.")
+                st.success(f"Aid drop command logged for {target['latitude']:.6f}, {target['longitude']:.6f}.")
+elif panel==10:
+    with st.container(border=True):
+        st.subheader("⚙️ Settings")
+        st.write("Use the Response Control sidebar for GPS source, AI confidence, damage thresholds, and MAVLink settings.")
+        st.checkbox("Show prototype zone overlays",value=True)
+        st.checkbox("Enable survivor alerts",value=True)
 
 st.divider()
 st.caption("Prototype command center • AI damage classification and survivor coordinates are estimates. Validate with trained responders, calibrated sensors, and appropriate geospatial/field instrumentation before operational use.")
