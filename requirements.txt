@@ -1,6 +1,8 @@
-streamlit
-opencv-python-headless
-numpy
-pillow
-pandas
-ultralytics
+streamlit>=1.51,<2
+streamlit-webrtc>=0.76.2
+opencv-python-headless>=4.10
+numpy>=1.26
+pandas>=2.2
+pillow>=10.0
+ultralytics>=8.3
+pymavlink>=2.4
