@@ -11,3 +11,6 @@ pymavlink>=2.4
 folium
 streamlit-folium
 requests
+streamlit-webrtc>=0.76.2
+av>=12.0
+opencv-python-headless>=4.10
