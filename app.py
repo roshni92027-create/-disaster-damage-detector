@@ -686,8 +686,6 @@ def live_callback(frame):
 
     # 2) Run AI inference periodically so the video remains smooth.
     if time.time() - LIVE_LAST_INFER < 0.45:
-        with LIVE_LOCK:
-            _auto_save_rgb_snapshot(image,annotated,LIVE_DETECTIONS)
         return av.VideoFrame.from_ndarray(annotated,format="bgr24")
 
     LIVE_LAST_INFER=time.time()
@@ -699,19 +697,20 @@ def live_callback(frame):
             for b in result.boxes:
                 xy=b.xyxy[0].cpu().numpy().tolist()
                 label=str(result.names[int(b.cls[0])]); score=float(b.conf[0])
+                # RGB live AI is survivor-only: ignore every class except person.
+                if label.lower() != "person":
+                    continue
                 item={"Class":label,"Confidence":round(score,3),"X1":round(xy[0]),"Y1":round(xy[1]),"X2":round(xy[2]),"Y2":round(xy[3])}
                 det.append(item)
-                if label.lower()=="person":
-                    x1,y1,x2,y2=map(int,xy)
-                    cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,80,255),2)
-                    cv2.putText(annotated,f"SURVIVOR {score:.0%}",(x1,max(20,y1-8)),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,80,255),2)
+                x1,y1,x2,y2=map(int,xy)
+                cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,80,255),2)
+                cv2.putText(annotated,f"SURVIVOR {score:.0%}",(x1,max(20,y1-8)),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,80,255),2)
         except Exception:
             det=[]
 
     with LIVE_LOCK:
         LIVE_FRAME=image.copy()
         LIVE_DETECTIONS=det
-        _auto_save_rgb_snapshot(image,annotated,det)
 
     # 3) A person detection creates an alert and associates the current snapshot.
     persons=[x for x in det if x["Class"].lower()=="person"]
@@ -803,6 +802,9 @@ if "damage_zones" not in st.session_state: st.session_state.damage_zones=[]
 if "active_panel" not in st.session_state: st.session_state.active_panel=None
 if "selected_survivor" not in st.session_state: st.session_state.selected_survivor=None
 if "selected_map_coord" not in st.session_state: st.session_state.selected_map_coord=None
+if "offline_map" not in st.session_state: st.session_state.offline_map=None
+if "offline_map_upload_hash" not in st.session_state: st.session_state.offline_map_upload_hash=None
+if "map_version" not in st.session_state: st.session_state.map_version=0
 if "toast_seen" not in st.session_state: st.session_state.toast_seen=set()
 
 # -------------------- CONTROL SIDEBAR --------------------
@@ -865,7 +867,7 @@ with left:
             rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
             async_processing=False,
         )
-        st.caption("▶ Press START above: recording begins automatically and an RGB snapshot is saved every 3 seconds. No Take Photo button is required.")
+        st.caption("▶ Press START above: recording begins automatically. A photo is saved only when AI detects a person/survivor.")
         with LIVE_LOCK:
             recording_path=str(LIVE_VIDEO_PATH) if LIVE_VIDEO_PATH else None
             recording_frames=LIVE_VIDEO_FRAMES
@@ -924,13 +926,20 @@ with center:
         with c3: center_drone=st.button("🎯 Drone",use_container_width=True,key="center_drone")
         if search_clicked and map_search.strip():
             target=parse_map_coordinates(map_search.strip()) or geocode_location(map_search.strip())
-            if target: st.session_state.map_center=target; st.session_state.map_zoom=16
+            if target:
+                st.session_state.map_center=target
+                st.session_state.map_zoom=16
+                st.session_state.map_version += 1
             else: st.warning("Location not found.")
-        if center_drone: st.session_state.map_center=[gps["lat"],gps["lon"]]; st.session_state.map_zoom=17
+        if center_drone:
+            st.session_state.map_center=[float(gps["lat"]),float(gps["lon"])]
+            st.session_state.map_zoom=18
+            st.session_state.map_version += 1
+
         path=telemetry[-100:] if telemetry else [{"lat":gps["lat"],"lon":gps["lon"]}]
         if len(path)<2: path=[{"lat":gps["lat"]-.001,"lon":gps["lon"]-.001},gps]
         operation_map=create_interactive_operation_map(gps,telemetry,responder_state(gps),[{"lat":a.get("latitude"),"lon":a.get("longitude")} for a in alerts[-10:] if a.get("latitude") is not None],st.session_state.damage_zones,st.session_state.get("offline_map"))
-        map_state=st_folium(operation_map,width=1200,height=680,returned_objects=["last_clicked","last_object_clicked"],key="operation_map")
+        map_state=st_folium(operation_map,width=1200,height=680,returned_objects=["last_clicked","last_object_clicked"],key=f"operation_map_{st.session_state.map_version}")
         if map_state:
             if map_state.get("last_clicked"):
                 c=map_state["last_clicked"]; st.session_state.selected_map_coord=[c["lat"],c["lng"]]
@@ -939,6 +948,41 @@ with center:
                 if obj.get("lat") is not None and obj.get("lng") is not None: st.session_state.selected_map_coord=[obj["lat"],obj["lng"]]
         if st.session_state.selected_map_coord: st.markdown(f'<div class="map-chip">📍 SELECTED {st.session_state.selected_map_coord[0]:.6f}, {st.session_state.selected_map_coord[1]:.6f}</div>',unsafe_allow_html=True)
         st.caption(f"🛸 D1 {gps['lat']:.6f}, {gps['lon']:.6f} • Alt {gps['altitude']:.1f} m • Heading {gps['heading']:.0f}°")
+
+        # Offline map upload is placed directly below the Live Operation Map.
+        st.markdown("#### 🗺️ OFFLINE MAP")
+        offline_up=st.file_uploader(
+            "Upload offline map",
+            type=["jpg","jpeg","png","webp"],
+            key="live_operation_offline_map",
+        )
+        if offline_up is not None:
+            try:
+                raw=offline_up.getvalue()
+                upload_hash=hashlib.sha256(raw).hexdigest()
+                if upload_hash != st.session_state.offline_map_upload_hash:
+                    arr=np.frombuffer(raw,dtype=np.uint8)
+                    offline_image=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+                    if offline_image is None:
+                        st.error("Unable to read the offline map image.")
+                    else:
+                        st.session_state.offline_map=offline_image
+                        st.session_state.offline_map_upload_hash=upload_hash
+                        st.session_state.map_version += 1
+                if st.session_state.offline_map is not None:
+                    st.image(
+                        cv2.cvtColor(st.session_state.offline_map,cv2.COLOR_BGR2RGB),
+                        caption="Offline Map",
+                        width="stretch",
+                    )
+            except Exception as e:
+                st.error(f"Offline map error: {e}")
+        elif st.session_state.offline_map is not None:
+            st.image(
+                cv2.cvtColor(st.session_state.offline_map,cv2.COLOR_BGR2RGB),
+                caption="Offline Map",
+                width="stretch",
+            )
     else: st.error("Install folium and streamlit-folium.")
     st.markdown('</div>',unsafe_allow_html=True)
 
@@ -951,7 +995,7 @@ with right:
             cc1,cc2=st.columns(2)
             with cc1:
                 if st.button("📍 CENTER",key=f"center_{a.get('alert_id')}",width="stretch"):
-                    st.session_state.map_center=[a["latitude"],a["longitude"]]; st.session_state.map_zoom=18; st.session_state.selected_survivor=a.get("alert_id"); st.rerun()
+                    st.session_state.map_center=[a["latitude"],a["longitude"]]; st.session_state.map_zoom=18; st.session_state.selected_survivor=a.get("alert_id"); st.session_state.map_version += 1; st.rerun()
             with cc2:
                 if st.button("🗑️ DELETE",key=f"del_{a.get('alert_id')}",width="stretch"):
                     alerts=[x for x in alerts if x.get("alert_id")!=a.get("alert_id")]; save_json(ALERTS_FILE,alerts)
@@ -1006,7 +1050,7 @@ for i,label in enumerate(cmds):
     with cc[i]:
         if st.button(label,key=f"cmd_{i}",width="stretch"): st.session_state.active_panel=i
 if st.session_state.active_panel==0:
-    up=st.file_uploader("Offline orthophoto",["jpg","jpeg","png","webp"],key="offline_map")
+    up=st.file_uploader("Offline orthophoto",["jpg","jpeg","png","webp"],key="offline_orthophoto_upload")
     if up:
         st.session_state.offline_map=cv_image(up); st.success("Offline map loaded.")
 elif st.session_state.active_panel==1:
