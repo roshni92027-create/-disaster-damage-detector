@@ -59,7 +59,7 @@ st.set_page_config(
 st.markdown("""
 <style>
 .stApp,[data-testid="stAppViewContainer"],[data-testid="stHeader"]{background:#030914;color:#eaf4ff}
-.block-container{padding:0.8rem 1rem 1.2rem;max-width:1900px}
+.block-container{padding:2.6rem 1rem 1.2rem;max-width:1900px}
 [data-testid="stSidebar"]{background:#06111e;border-right:1px solid #17314b}
 h1,h2,h3,h4{color:#f4f8ff!important} p,span,label{color:#a9bdd1}
 .topbar{background:linear-gradient(90deg,#071626,#081d31);border:1px solid #173c5b;border-radius:16px;padding:14px 18px;margin-bottom:12px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
@@ -857,7 +857,7 @@ left,center,right=st.columns([1.35,3.25,1.45],gap="small")
 
 # -------------------- LEFT: LIVE INTELLIGENCE --------------------
 with left:
-    st.markdown('<div class="panel"><div class="panel-head"><span>📹 RGB LIVE FEED</span><span class="live-badge">● LIVE</span></div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel"><div class="panel-head"><span>📹 RGB LIVE FEED • DRONE D1</span><span class="live-badge">● LIVE</span></div>',unsafe_allow_html=True)
     if WEBRTC_AVAILABLE:
         webrtc_result=webrtc_streamer(
             key="live-disaster-camera",
@@ -867,7 +867,7 @@ with left:
             rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
             async_processing=False,
         )
-        st.caption("▶ Press START above: recording begins automatically. A photo is saved only when AI detects a person/survivor.")
+        st.caption("▶ START the live drone camera feed. Recording begins automatically; a photo is saved only when AI detects a person/survivor.")
         with LIVE_LOCK:
             recording_path=str(LIVE_VIDEO_PATH) if LIVE_VIDEO_PATH else None
             recording_frames=LIVE_VIDEO_FRAMES
