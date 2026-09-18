@@ -361,7 +361,7 @@ with LIVE_LOCK: LIVE_GPS=gps.copy()
 
 alerts=load_json(ALERTS_FILE,[])
 scan_records=load_json(EVENTS_FILE,[])
-aid_records=load_json(AID_FILE)
+aid_records=load_json(AID_FILE, [])
 telemetry=load_json(TELEMETRY_FILE,[])
 if not telemetry:
     telemetry=[gps]
