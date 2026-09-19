@@ -597,22 +597,31 @@ def create_interactive_operation_map(
     return m
 
 # Thread-shared live state. Streamlit UI never writes from the WebRTC callback.
-# Thread-shared live state. The WebRTC callback owns camera capture, automatic
-# snapshots, and segmented video recording. Streamlit UI only reads this state.
+# The WebRTC callback owns camera capture, person detection, survivor snapshots,
+# movement tracking, coordinate updates, and segmented video recording.
 LIVE_LOCK=threading.Lock()
 LIVE_FRAME=None
 LIVE_DETECTIONS=[]
 LIVE_EVENTS=queue.Queue()
-LIVE_LAST_ALERT=0.0
 LIVE_LAST_INFER=0.0
-LIVE_LAST_SNAPSHOT=0.0
 LIVE_VIDEO_WRITER=None
 LIVE_VIDEO_PATH=None
 LIVE_VIDEO_STARTED=0.0
 LIVE_VIDEO_FRAMES=0
 LIVE_VIDEO_SEGMENT_SECONDS=60
-LIVE_AUTO_SNAPSHOT_SECONDS=3
 LIVE_GPS=DEFAULT_GPS.copy()
+
+# Survivor tracking:
+# - A newly detected person gets one captured image + coordinate immediately.
+# - A stationary person gets no repeated coordinate alerts.
+# - A moving person gets a coordinate update at most every 5 seconds.
+LIVE_TRACKS={}
+LIVE_NEXT_TRACK_ID=1
+LIVE_TRACK_MATCH_METERS=25.0
+LIVE_MOVEMENT_THRESHOLD_METERS=5.0
+LIVE_COORD_UPDATE_SECONDS=5.0
+LIVE_TRACK_TIMEOUT_SECONDS=30.0
+
 
 def _open_live_video_writer(width, height):
     """Open a new 60-second MJPG/AVI segment for reliable server-side recording."""
@@ -624,10 +633,8 @@ def _open_live_video_writer(width, height):
         pass
     stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
     path=FOOTAGE_DIR/f"rgb_live_{stamp}.avi"
-    # MJPG in AVI is widely supported by OpenCV on local machines and Streamlit Cloud.
     writer=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"MJPG"),20.0,(int(width),int(height)))
     if not writer.isOpened():
-        # Fallback to mp4v if MJPG is unavailable.
         path=FOOTAGE_DIR/f"rgb_live_{stamp}.mp4"
         writer=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"mp4v"),20.0,(int(width),int(height)))
     if writer.isOpened():
@@ -639,6 +646,7 @@ def _open_live_video_writer(width, height):
     LIVE_VIDEO_WRITER=None
     LIVE_VIDEO_PATH=None
     return False
+
 
 def _record_live_frame(image):
     """Record every incoming RGB frame and rotate files every 60 seconds."""
@@ -653,82 +661,221 @@ def _record_live_frame(image):
         except Exception:
             pass
 
-def _auto_save_rgb_snapshot(image, annotated, detections):
-    """Automatically save a JPEG every few seconds while the live camera is running."""
-    global LIVE_LAST_SNAPSHOT
-    if time.time()-LIVE_LAST_SNAPSHOT < LIVE_AUTO_SNAPSHOT_SECONDS:
-        return None
-    LIVE_LAST_SNAPSHOT=time.time()
-    stamp=datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-    path=FOOTAGE_DIR/f"rgb_auto_{stamp}.jpg"
-    try:
-        cv2.imwrite(str(path),annotated)
-        append_json(EVENTS_FILE,{
-            "event_id":uid("AUTO"),
-            "type":"Automatic RGB snapshot",
-            "image_path":str(path),
-            "detections":len(detections),
-            "timestamp":now()
-        },500)
-        return path
-    except Exception:
-        return None
+
+def _match_survivor_track(lat,lon,used_tracks):
+    """Match a detection to the nearest active survivor track."""
+    best_id=None
+    best_distance=float("inf")
+    now_ts=time.time()
+    for track_id,track in LIVE_TRACKS.items():
+        if track_id in used_tracks:
+            continue
+        if now_ts-track["last_seen"] > LIVE_TRACK_TIMEOUT_SECONDS:
+            continue
+        distance=haversine(track["lat"],track["lon"],lat,lon)*1000.0
+        if distance <= LIVE_TRACK_MATCH_METERS and distance < best_distance:
+            best_id=track_id
+            best_distance=distance
+    return best_id
+
+
+def _register_survivor_detection(det,gps,image_width,image_height,used_tracks=None):
+    """Return tracking/report information for one person detection."""
+    global LIVE_NEXT_TRACK_ID
+
+    lat,lon=estimate_position(
+        gps,
+        (det["X1"],det["Y1"],det["X2"],det["Y2"]),
+        image_width,
+        image_height,
+    )
+    current_time=time.time()
+    if used_tracks is None:
+        used_tracks=set()
+
+    track_id=_match_survivor_track(lat,lon,used_tracks)
+    if track_id is None:
+        track_id=f"S{LIVE_NEXT_TRACK_ID}"
+        LIVE_NEXT_TRACK_ID+=1
+        LIVE_TRACKS[track_id]={
+            "lat":lat,
+            "lon":lon,
+            "last_seen":current_time,
+            "last_report":0.0,
+            "last_report_lat":lat,
+            "last_report_lon":lon,
+            "ever_reported":False,
+        }
+        used_tracks.add(track_id)
+        return track_id,lat,lon,True,False
+
+    track=LIVE_TRACKS[track_id]
+    movement_from_last=haversine(track["lat"],track["lon"],lat,lon)*1000.0
+    movement_from_report=haversine(track["last_report_lat"],track["last_report_lon"],lat,lon)*1000.0
+
+    track["lat"]=lat
+    track["lon"]=lon
+    track["last_seen"]=current_time
+    used_tracks.add(track_id)
+
+    first_report=not track["ever_reported"]
+    moving=movement_from_report >= LIVE_MOVEMENT_THRESHOLD_METERS
+
+    report_now=False
+    if first_report:
+        report_now=True
+    elif moving and current_time-track["last_report"] >= LIVE_COORD_UPDATE_SECONDS:
+        report_now=True
+
+    return track_id,lat,lon,report_now,moving
+
+
+def _save_survivor_snapshot_and_alert(det,gps,annotated,image_shape,track_id,lat,lon,is_location_update=False):
+    """Save a survivor image only for detection events and log its coordinates."""
+    event_id=uid("LIVE")
+    image_path=None
+
+    # Only the initial human detection creates a new captured image.
+    # Movement updates send coordinates without creating duplicate images.
+    if not is_location_update:
+        image_path=FOOTAGE_DIR/f"{event_id}.jpg"
+        cv2.imwrite(str(image_path),annotated)
+
+    alert={
+        "alert_id":event_id,
+        "type":"Survivor location update" if is_location_update else "Possible Survivor",
+        "scan_id":event_id,
+        "track_id":track_id,
+        "latitude":lat,
+        "longitude":lon,
+        "confidence":det["Confidence"],
+        "timestamp":now(),
+        "gps_source":gps["source"],
+        "image_path":str(image_path) if image_path else None,
+        "is_location_update":is_location_update,
+    }
+    append_json(ALERTS_FILE,alert)
+    append_json(EVENTS_FILE,{
+        "event_id":event_id,
+        "type":"Survivor location update" if is_location_update else "Survivor detected",
+        "track_id":track_id,
+        "latitude":lat,
+        "longitude":lon,
+        "confidence":det["Confidence"],
+        "timestamp":alert["timestamp"],
+        "image_path":alert["image_path"],
+    },500)
+    return alert
+
 
 def live_callback(frame):
-    global LIVE_FRAME,LIVE_DETECTIONS,LIVE_LAST_ALERT,LIVE_LAST_INFER
+    global LIVE_FRAME,LIVE_DETECTIONS,LIVE_LAST_INFER
+
     image=frame.to_ndarray(format="bgr24")
     annotated=image.copy()
 
-    # 1) Record continuously as soon as the user presses START on the WebRTC camera.
+    # Continuous video recording remains unchanged.
     with LIVE_LOCK:
         _record_live_frame(image)
         LIVE_FRAME=image.copy()
 
-    # 2) Run AI inference periodically so the video remains smooth.
-    if time.time() - LIVE_LAST_INFER < 0.45:
+    # Run AI inference periodically so the live video remains smooth.
+    if time.time()-LIVE_LAST_INFER < 0.45:
         return av.VideoFrame.from_ndarray(annotated,format="bgr24")
 
     LIVE_LAST_INFER=time.time()
     det=[]
     model=load_model()
+
     if model is not None:
         try:
             result=model.predict(image,conf=.35,verbose=False)[0]
             for b in result.boxes:
                 xy=b.xyxy[0].cpu().numpy().tolist()
-                label=str(result.names[int(b.cls[0])]); score=float(b.conf[0])
-                # RGB live AI is survivor-only: ignore every class except person.
+                label=str(result.names[int(b.cls[0])])
+                score=float(b.conf[0])
+
+                # RGB live AI remains survivor-only.
                 if label.lower() != "person":
                     continue
-                item={"Class":label,"Confidence":round(score,3),"X1":round(xy[0]),"Y1":round(xy[1]),"X2":round(xy[2]),"Y2":round(xy[3])}
+
+                item={
+                    "Class":label,
+                    "Confidence":round(score,3),
+                    "X1":round(xy[0]),
+                    "Y1":round(xy[1]),
+                    "X2":round(xy[2]),
+                    "Y2":round(xy[3]),
+                }
                 det.append(item)
+
                 x1,y1,x2,y2=map(int,xy)
                 cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,80,255),2)
-                cv2.putText(annotated,f"SURVIVOR {score:.0%}",(x1,max(20,y1-8)),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,80,255),2)
+                cv2.putText(
+                    annotated,
+                    f"SURVIVOR {score:.0%}",
+                    (x1,max(20,y1-8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    .55,
+                    (0,80,255),
+                    2,
+                )
         except Exception:
             det=[]
 
     with LIVE_LOCK:
         LIVE_FRAME=image.copy()
         LIVE_DETECTIONS=det
+        gps=LIVE_GPS.copy()
 
-    # 3) A person detection creates an alert and associates the current snapshot.
-    persons=[x for x in det if x["Class"].lower()=="person"]
-    if persons and time.time()-LIVE_LAST_ALERT>10:
-        LIVE_LAST_ALERT=time.time()
-        with LIVE_LOCK: gps=LIVE_GPS.copy()
-        event_id=uid("LIVE")
-        alerts=[]
-        cap_path=FOOTAGE_DIR/f"{event_id}.jpg"
-        cv2.imwrite(str(cap_path),annotated)
-        for p in persons:
-            alert=make_alert(p,gps,event_id,image.shape[1],image.shape[0])
-            alert["image_path"]=str(cap_path)
-            append_json(ALERTS_FILE,alert)
-            alerts.append(alert)
-        LIVE_EVENTS.put({"event_id":event_id,"alerts":alerts})
+    # Track every detected person independently.
+    used_tracks=set()
+    for person in det:
+        try:
+            track_id,lat,lon,report_now,moving=_register_survivor_detection(
+                person,
+                gps,
+                image.shape[1],
+                image.shape[0],
+                used_tracks,
+            )
+            track=LIVE_TRACKS[track_id]
+
+            if report_now:
+                is_update=bool(track["ever_reported"])
+                alert=_save_survivor_snapshot_and_alert(
+                    person,
+                    gps,
+                    annotated,
+                    image.shape,
+                    track_id,
+                    lat,
+                    lon,
+                    is_location_update=is_update,
+                )
+
+                track["last_report"]=time.time()
+                track["last_report_lat"]=lat
+                track["last_report_lon"]=lon
+                track["ever_reported"]=True
+
+                LIVE_EVENTS.put({
+                    "event_id":alert["alert_id"],
+                    "alerts":[alert],
+                    "moving":moving,
+                })
+        except Exception:
+            # One problematic detection should never stop the live video.
+            continue
+
+    # Remove stale survivor tracks so old people do not get matched forever.
+    current_time=time.time()
+    stale=[tid for tid,t in LIVE_TRACKS.items()
+           if current_time-t["last_seen"] > LIVE_TRACK_TIMEOUT_SECONDS]
+    for tid in stale:
+        LIVE_TRACKS.pop(tid,None)
+
     return av.VideoFrame.from_ndarray(annotated,format="bgr24")
-
 
 
 def responder_state(gps):
@@ -786,9 +933,10 @@ def damage_zones_from_diff(diff,gps,min_area_ratio=.002,threshold=35):
 
 def mission_stats(alerts,zones,responders,aid_records,scanned_area=4.2):
     critical=sum(z.get("area_percent",0) for z in zones if z.get("kind")=="critical")
-    progress=min(99,int(35+len(zones)*6+len(alerts)*4+len(aid_records)*3))
+    survivor_alerts=[a for a in alerts if not a.get("is_location_update")]
+    progress=min(99,int(35+len(zones)*6+len(survivor_alerts)*4+len(aid_records)*3))
     active=sum(r.get("status") in ("MOVING","ON SITE") for r in responders)
-    return {"progress":progress,"survivors":len(alerts),"responders_active":active,
+    return {"progress":progress,"survivors":len(survivor_alerts),"responders_active":active,
             "responders_total":len(responders),"zones":len(zones),"critical_pct":critical,
             "area_scanned":scanned_area,"aid_drops":len(aid_records)}
 
@@ -806,6 +954,8 @@ if "offline_map" not in st.session_state: st.session_state.offline_map=None
 if "offline_map_upload_hash" not in st.session_state: st.session_state.offline_map_upload_hash=None
 if "map_version" not in st.session_state: st.session_state.map_version=0
 if "toast_seen" not in st.session_state: st.session_state.toast_seen=set()
+if "post_source" not in st.session_state: st.session_state.post_source="Upload image"
+if "post_capture_path" not in st.session_state: st.session_state.post_capture_path=None
 
 # -------------------- CONTROL SIDEBAR --------------------
 with st.sidebar:
@@ -895,25 +1045,151 @@ with left:
     st.markdown('</div>',unsafe_allow_html=True)
 
     st.markdown('<div class="panel"><div class="panel-head"><span>🛰️ DAMAGE INTELLIGENCE</span><span class="danger-badge">PRE ↔ POST</span></div>',unsafe_allow_html=True)
+
+    # PRE-DISASTER IMAGE
     pre_up=st.file_uploader("Pre-disaster image",["jpg","jpeg","png","webp"],key="pre_left")
-    post_up=st.file_uploader("Post-disaster image",["jpg","jpeg","png","webp"],key="post_left")
-    if pre_up: st.session_state.pre=cv_image(pre_up)
-    if post_up: st.session_state.post=cv_image(post_up)
+    if pre_up:
+        st.session_state.pre=cv_image(pre_up)
+
+    if st.session_state.pre is not None:
+        st.image(
+            rgb(st.session_state.pre),
+            caption="PRE-DISASTER IMAGE",
+            width="stretch",
+        )
+
     if pre_up and st.button("💾 INDEX PRE-DISASTER IMAGE",width="stretch"):
-        p=PREPOST_DIR/f"pre_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"; cv2.imwrite(str(p),st.session_state.pre); append_json(SCANS_FILE,{"scan_id":uid("SCAN"),"type":"Pre-Disaster","lat":gps["lat"],"lon":gps["lon"],"timestamp":now(),"image_path":str(p)},500); st.success("Pre-disaster reference indexed.")
-    if post_up and not pre_up:
+        p=PREPOST_DIR/f"pre_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(str(p),st.session_state.pre)
+        append_json(
+            SCANS_FILE,
+            {
+                "scan_id":uid("SCAN"),
+                "type":"Pre-Disaster",
+                "lat":gps["lat"],
+                "lon":gps["lon"],
+                "timestamp":now(),
+                "image_path":str(p),
+            },
+            500,
+        )
+        st.success("Pre-disaster reference indexed.")
+
+    # POST-DISASTER IMAGE: upload OR choose an already captured survivor image.
+    post_source=st.selectbox(
+        "Post-disaster image source",
+        ["Upload image","Captured images"],
+        key="post_source",
+    )
+
+    post_up=None
+    selected_capture=None
+
+    if post_source=="Upload image":
+        post_up=st.file_uploader(
+            "Post-disaster image",
+            ["jpg","jpeg","png","webp"],
+            key="post_left",
+        )
+        if post_up:
+            st.session_state.post=cv_image(post_up)
+            st.session_state.post_capture_path=None
+    else:
+        captured_paths=sorted(
+            [p for p in FOOTAGE_DIR.glob("LIVE_*.jpg") if p.exists()],
+            key=lambda p:p.stat().st_mtime,
+            reverse=True,
+        )
+        if captured_paths:
+            capture_labels=[p.name for p in captured_paths]
+            selected_name=st.selectbox(
+                "Select captured image",
+                capture_labels,
+                key="post_capture_select",
+            )
+            selected_capture=next(
+                (p for p in captured_paths if p.name==selected_name),
+                None,
+            )
+            if selected_capture is not None:
+                selected_image=cv2.imread(str(selected_capture))
+                if selected_image is not None:
+                    st.session_state.post=selected_image
+                    st.session_state.post_capture_path=str(selected_capture)
+        else:
+            st.info("No captured survivor images available yet. Detect a person first.")
+
+    if st.session_state.post is not None:
+        caption="POST-DISASTER IMAGE"
+        if st.session_state.post_capture_path:
+            caption=f"POST-DISASTER • {Path(st.session_state.post_capture_path).name}"
+        st.image(
+            rgb(st.session_state.post),
+            caption=caption,
+            width="stretch",
+        )
+
+    # Preserve the existing nearby-reference behavior when a post image is uploaded
+    # without a pre image in the current session.
+    if post_up is not None and pre_up is None:
         matched=nearest_pre_scan(gps["lat"],gps["lon"],2.0)
         if matched:
-            d,scan=matched; st.info(f"Matched reference: {d:.3f} km • {scan['scan_id']}"); st.session_state.pre=cv2.imread(scan["image_path"])
+            d,scan=matched
+            st.info(f"Matched reference: {d:.3f} km • {scan['scan_id']}")
+            st.session_state.pre=cv2.imread(scan["image_path"])
+
     if st.session_state.pre is not None and st.session_state.post is not None and st.button("⚡ RUN REAL DAMAGE COMPARISON",width="stretch"):
         cmap,diff,dstats=damage_compare(st.session_state.pre,st.session_state.post,critical,moderate,low)
-        p=PREPOST_DIR/f"post_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"; cv2.imwrite(str(p),st.session_state.post)
-        append_json(SCANS_FILE,{"scan_id":uid("SCAN"),"type":"Post-Disaster","lat":gps["lat"],"lon":gps["lon"],"timestamp":now(),"image_path":str(p),"damage_statistics":dstats},500)
-        append_json(EVENTS_FILE,{"event_id":uid("COMPARE"),"type":"Pre/Post comparison","lat":gps["lat"],"lon":gps["lon"],"timestamp":now(),"damage_statistics":dstats},500)
-        st.session_state.last_result={"damage_map":cmap,"stats":dstats,"diff":diff}; st.session_state.damage_zones=damage_zones_from_diff(diff,gps,threshold=low); st.rerun()
+        p=PREPOST_DIR/f"post_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(str(p),st.session_state.post)
+        append_json(
+            SCANS_FILE,
+            {
+                "scan_id":uid("SCAN"),
+                "type":"Post-Disaster",
+                "lat":gps["lat"],
+                "lon":gps["lon"],
+                "timestamp":now(),
+                "image_path":str(p),
+                "damage_statistics":dstats,
+            },
+            500,
+        )
+        append_json(
+            EVENTS_FILE,
+            {
+                "event_id":uid("COMPARE"),
+                "type":"Pre/Post comparison",
+                "lat":gps["lat"],
+                "lon":gps["lon"],
+                "timestamp":now(),
+                "damage_statistics":dstats,
+            },
+            500,
+        )
+        st.session_state.last_result={"damage_map":cmap,"stats":dstats,"diff":diff}
+        st.session_state.damage_zones=damage_zones_from_diff(diff,gps,threshold=low)
+        st.rerun()
+
     if st.session_state.last_result:
-        r=st.session_state.last_result; st.image(rgb(r["damage_map"]),caption="Detected change / damage map",width="stretch"); st.dataframe(pd.DataFrame({"Class":list(r["stats"]),"Area %":list(r["stats"].values())}),hide_index=True,width="stretch")
+        r=st.session_state.last_result
+        st.image(
+            rgb(r["damage_map"]),
+            caption="Detected change / damage map",
+            width="stretch",
+        )
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Class":list(r["stats"]),
+                    "Area %":list(r["stats"].values()),
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+        )
         st.caption(f"Detected map zones: {len(st.session_state.damage_zones)}")
+
     st.markdown('</div>',unsafe_allow_html=True)
 
 # -------------------- CENTER: MAP --------------------
@@ -991,7 +1267,8 @@ with right:
     st.markdown('<div class="panel"><div class="panel-head"><span>🚨 AI ALERTS</span><span class="danger-badge">LIVE</span></div>',unsafe_allow_html=True)
     if alerts:
         for a in reversed(alerts[-5:]):
-            st.markdown(f'<div class="alert-row"><div class="alert-title">🚨 Survivor detected</div><div class="alert-detail">Confidence {float(a.get("confidence",0))*100:.0f}% • {a.get("timestamp","")}</div><div class="coord">{float(a.get("latitude",0)):.6f}, {float(a.get("longitude",0)):.6f}</div></div>',unsafe_allow_html=True)
+            alert_title="📍 Survivor location update" if a.get("is_location_update") else "🚨 Survivor detected"
+            st.markdown(f'<div class="alert-row"><div class="alert-title">{alert_title}</div><div class="alert-detail">Confidence {float(a.get("confidence",0))*100:.0f}% • {a.get("timestamp","")}</div><div class="coord">{float(a.get("latitude",0)):.6f}, {float(a.get("longitude",0)):.6f}</div></div>',unsafe_allow_html=True)
             cc1,cc2=st.columns(2)
             with cc1:
                 if st.button("📍 CENTER",key=f"center_{a.get('alert_id')}",width="stretch"):
@@ -1023,7 +1300,7 @@ with b1:
     st.markdown('</div>',unsafe_allow_html=True)
 with b2:
     st.markdown('<div class="panel"><div class="panel-head"><span>🧰 AID KIT MANAGEMENT</span></div>',unsafe_allow_html=True)
-    options=[a for a in alerts[-20:] if a.get("latitude") is not None]
+    options=[a for a in alerts[-50:] if a.get("latitude") is not None and not a.get("is_location_update")]
     if options:
         labels=[f"{a.get('alert_id','SURVIVOR')} • {a['latitude']:.6f}, {a['longitude']:.6f}" for a in options]
         idx=st.selectbox("Target survivor",range(len(labels)),format_func=lambda i:labels[i],key="aid_target")
