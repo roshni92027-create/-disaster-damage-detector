@@ -321,13 +321,25 @@ def parse_map_coordinates(text):
 
 
 def geocode_location(query):
-    """Online place-name search using Nominatim; coordinate search works offline."""
+    """Search a place name online, with Nominatim and ArcGIS fallbacks."""
+    query = str(query).strip()
+    if not query:
+        return None
+
+    # OpenStreetMap / Nominatim
     try:
         response = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "jsonv2", "limit": 1},
-            headers={"User-Agent": "disaster-damage-detector/1.0"},
-            timeout=5,
+            params={
+                "q": query,
+                "format": "jsonv2",
+                "limit": 1,
+                "countrycodes": "",
+            },
+            headers={
+                "User-Agent": "DisasterDamageDetector/1.0 (Streamlit map search)"
+            },
+            timeout=8,
         )
         response.raise_for_status()
         results = response.json()
@@ -335,6 +347,27 @@ def geocode_location(query):
             return [float(results[0]["lat"]), float(results[0]["lon"])]
     except Exception:
         pass
+
+    # ArcGIS fallback — useful when Nominatim is unavailable/blocked.
+    try:
+        response = requests.get(
+            "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates",
+            params={
+                "SingleLine": query,
+                "f": "json",
+                "maxLocations": 1,
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        candidates = response.json().get("candidates", [])
+        if candidates:
+            location = candidates[0].get("location", {})
+            if "y" in location and "x" in location:
+                return [float(location["y"]), float(location["x"])]
+    except Exception:
+        pass
+
     return None
 
 
@@ -361,6 +394,10 @@ def create_interactive_operation_map(
         st.session_state.map_center = [lat, lon]
     if "map_zoom" not in st.session_state:
         st.session_state.map_zoom = 15
+    if "map_base_layer" not in st.session_state:
+        st.session_state.map_base_layer = "Street Map"
+    if "show_responders" not in st.session_state:
+        st.session_state.show_responders = True
 
     center = st.session_state.map_center
     zoom = int(st.session_state.map_zoom)
@@ -379,6 +416,7 @@ def create_interactive_operation_map(
         name="Street Map",
         overlay=False,
         control=True,
+        show=(st.session_state.map_base_layer == "Street Map"),
     ).add_to(m)
 
     # Satellite imagery layer. This is an online layer; the offline image
@@ -392,6 +430,7 @@ def create_interactive_operation_map(
         name="Satellite",
         overlay=False,
         control=True,
+        show=(st.session_state.map_base_layer == "Satellite"),
     ).add_to(m)
 
     folium.TileLayer(
@@ -400,6 +439,7 @@ def create_interactive_operation_map(
         name="Terrain",
         overlay=False,
         control=True,
+        show=(st.session_state.map_base_layer == "Terrain"),
     ).add_to(m)
 
     # Google-Maps-style controls.
@@ -540,7 +580,10 @@ def create_interactive_operation_map(
     # -------------------------
     # Responders
     # -------------------------
-    responder_group = folium.FeatureGroup(name="Responders", show=True)
+    responder_group = folium.FeatureGroup(
+        name="Responders",
+        show=bool(st.session_state.show_responders),
+    )
     for i, responder in enumerate(responders, 1):
         try:
             r_lat = float(responder["lat"])
@@ -617,30 +660,6 @@ def create_interactive_operation_map(
         except Exception:
             continue
     zone_group.add_to(m)
-
-    # -------------------------
-    # Approximate offline orthophoto overlay
-    # -------------------------
-    if offline_image is not None:
-        try:
-            radius_km = 2.0
-            lat_delta = radius_km / 111.32
-            lon_delta = radius_km / (
-                111.32 * max(math.cos(math.radians(lat)), 0.1)
-            )
-            bounds = [
-                [lat - lat_delta, lon - lon_delta],
-                [lat + lat_delta, lon + lon_delta],
-            ]
-            folium.raster_layers.ImageOverlay(
-                image=cv2.cvtColor(offline_image, cv2.COLOR_BGR2RGB),
-                bounds=bounds,
-                opacity=0.55,
-                name="Offline Orthophoto",
-                interactive=True,
-            ).add_to(m)
-        except Exception:
-            pass
 
     folium.LayerControl(position="topright", collapsed=False).add_to(m)
     return m
@@ -1002,6 +1021,8 @@ if "selected_map_coord" not in st.session_state: st.session_state.selected_map_c
 if "offline_map" not in st.session_state: st.session_state.offline_map=None
 if "offline_map_upload_hash" not in st.session_state: st.session_state.offline_map_upload_hash=None
 if "map_version" not in st.session_state: st.session_state.map_version=0
+if "map_base_layer" not in st.session_state: st.session_state.map_base_layer="Street Map"
+if "show_responders" not in st.session_state: st.session_state.show_responders=True
 if "toast_seen" not in st.session_state: st.session_state.toast_seen=set()
 if "post_source" not in st.session_state: st.session_state.post_source="Upload image"
 if "post_capture_path" not in st.session_state: st.session_state.post_capture_path=None
@@ -1227,28 +1248,73 @@ with left:
             caption="Detected change / damage map",
             width="stretch",
         )
+        damage_df = pd.DataFrame(
+            {
+                "Class": list(r["stats"]),
+                "Area %": list(r["stats"].values()),
+            }
+        )
         st.dataframe(
-            pd.DataFrame(
-                {
-                    "Class":list(r["stats"]),
-                    "Area %":list(r["stats"].values()),
-                }
-            ),
+            damage_df,
             hide_index=True,
             width="stretch",
         )
+
+        # -------------------- DAMAGE GRAPH --------------------
+        st.markdown("#### 📊 DAMAGE DISTRIBUTION GRAPH")
+        chart_df = damage_df.set_index("Class")
+        st.bar_chart(
+            chart_df,
+            y="Area %",
+            height=260,
+            use_container_width=True,
+        )
+        st.caption("Graph uses the actual Safe / Low / Moderate / Critical percentages calculated from the current PRE ↔ POST comparison.")
         st.caption(f"Detected map zones: {len(st.session_state.damage_zones)}")
 
     st.markdown('</div>',unsafe_allow_html=True)
 
 # -------------------- CENTER: MAP --------------------
 with center:
-    st.markdown('<div class="panel"><div class="panel-head"><span>🗺️ LIVE OPERATION MAP</span><span class="map-chip">SATELLITE</span><span class="map-chip">STREET</span><span class="map-chip">RESPONDERS</span></div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel"><div class="panel-head"><span>🗺️ LIVE OPERATION MAP</span><span class="map-chip">INTERACTIVE</span></div>',unsafe_allow_html=True)
     if FOLIUM_AVAILABLE:
-        c1,c2,c3=st.columns([4.3,1.0,1.2])
-        with c1: map_search=st.text_input("Search",placeholder="Place or latitude, longitude",label_visibility="collapsed",key="map_search")
-        with c2: search_clicked=st.button("🔍 Search",use_container_width=True,key="map_search_button")
-        with c3: center_drone=st.button("🎯 Drone",use_container_width=True,key="center_drone")
+        s1,s2,s3,s4,s5=st.columns([3.6,1.0,1.0,1.1,1.1])
+        with s1:
+            map_search=st.text_input(
+                "Search",
+                placeholder="Place or latitude, longitude",
+                label_visibility="collapsed",
+                key="map_search",
+            )
+        with s2:
+            search_clicked=st.button("🔍 Search",use_container_width=True,key="map_search_button")
+        with s3:
+            center_drone=st.button("🎯 Drone",use_container_width=True,key="center_drone")
+        with s4:
+            satellite_clicked=st.button("🛰️ Satellite",use_container_width=True,key="map_satellite_button")
+        with s5:
+            street_clicked=st.button("🛣️ Street",use_container_width=True,key="map_street_button")
+
+        r1,r2=st.columns([1.15,4.55])
+        with r1:
+            responders_clicked=st.button(
+                "🪖 Responders",
+                use_container_width=True,
+                key="map_responders_button",
+            )
+        with r2:
+            st.caption("Use the map's top-right layer control for additional layers such as Terrain, Damage Zones and Survivor Alerts.")
+
+        if satellite_clicked:
+            st.session_state.map_base_layer="Satellite"
+            st.session_state.map_version += 1
+        if street_clicked:
+            st.session_state.map_base_layer="Street Map"
+            st.session_state.map_version += 1
+        if responders_clicked:
+            st.session_state.show_responders=not st.session_state.show_responders
+            st.session_state.map_version += 1
+
         if search_clicked and map_search.strip():
             target=parse_map_coordinates(map_search.strip()) or geocode_location(map_search.strip())
             if target:
@@ -1263,7 +1329,14 @@ with center:
 
         path=telemetry[-100:] if telemetry else [{"lat":gps["lat"],"lon":gps["lon"]}]
         if len(path)<2: path=[{"lat":gps["lat"]-.001,"lon":gps["lon"]-.001},gps]
-        operation_map=create_interactive_operation_map(gps,telemetry,responder_state(gps),[{"lat":a.get("latitude"),"lon":a.get("longitude")} for a in alerts[-10:] if a.get("latitude") is not None],st.session_state.damage_zones,st.session_state.get("offline_map"))
+        operation_map=create_interactive_operation_map(
+            gps,
+            telemetry,
+            responder_state(gps),
+            [{"lat":a.get("latitude"),"lon":a.get("longitude")} for a in alerts[-10:] if a.get("latitude") is not None],
+            st.session_state.damage_zones,
+            None,
+        )
         map_state=st_folium(operation_map,width=1200,height=680,returned_objects=["last_clicked","last_object_clicked"],key=f"operation_map_{st.session_state.map_version}")
         if map_state:
             if map_state.get("last_clicked"):
@@ -1365,6 +1438,8 @@ with b3:
         ds=st.session_state.last_result["stats"]
         for name,val in ds.items(): st.markdown(f"**{name}**  \
 {val:.1f}%")
+        latest_graph_df=pd.DataFrame({"Class":list(ds),"Area %":list(ds.values())}).set_index("Class")
+        st.bar_chart(latest_graph_df,y="Area %",height=180,use_container_width=True)
     else: st.caption("Upload matching pre/post images and run comparison.")
     st.markdown('</div>',unsafe_allow_html=True)
 
@@ -1396,4 +1471,3 @@ elif st.session_state.active_panel==4:
     st.info("Use the Aid Kit Management panel above for targeted drops.")
 
 st.divider(); st.caption("Prototype command center • Damage zones are computed from image change detection; survivor coordinates are estimated from camera geometry/GPS. Validate with calibrated geospatial data and trained responders before operational use.")
-
