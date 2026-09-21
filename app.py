@@ -1,4 +1,5 @@
 
+
 from pathlib import Path
 from datetime import datetime
 import json
@@ -55,6 +56,54 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# -------------------- LOGIN --------------------
+LOGIN_USERNAME = "admin"
+LOGIN_PASSWORD = "disaster123"
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+def login_page():
+    st.markdown(
+        """
+        <div style="
+            max-width:500px;
+            margin:90px auto 20px auto;
+            padding:35px;
+            background:#081522;
+            border:1px solid #173650;
+            border-radius:18px;
+            text-align:center;
+            box-shadow:0 10px 40px rgba(0,0,0,.35);
+        ">
+            <div style="font-size:3rem;">🛡️</div>
+            <h1 style="margin-bottom:5px;">Disaster Response</h1>
+            <p style="color:#6e91ad;">COMMAND CENTER LOGIN</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        if st.button("🔐 LOGIN", width="stretch", type="primary"):
+            if username == LOGIN_USERNAME and password == LOGIN_PASSWORD:
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+if not st.session_state.logged_in:
+    login_page()
+    st.stop()
+
+# -------------------- END LOGIN --------------------
+
 
 st.markdown("""
 <style>
@@ -1347,3 +1396,4 @@ elif st.session_state.active_panel==4:
     st.info("Use the Aid Kit Management panel above for targeted drops.")
 
 st.divider(); st.caption("Prototype command center • Damage zones are computed from image change detection; survivor coordinates are estimated from camera geometry/GPS. Validate with calibrated geospatial data and trained responders before operational use.")
+
