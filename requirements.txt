@@ -6,7 +6,11 @@ opencv-python-headless>=4.10
 numpy>=1.26
 pandas>=2.2
 pillow>=10.0
-ultralytics-opencv-headless>=8.4.100
+ultralytics>=8.3
 pymavlink>=2.4
+folium
+streamlit-folium
 requests
+streamlit-webrtc>=0.76.2
 av>=12.0
+opencv-python-headless>=4.10
